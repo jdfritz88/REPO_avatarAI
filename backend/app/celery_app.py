@@ -1,4 +1,6 @@
 import logging
+import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -44,7 +46,10 @@ def process_avatar_task(self, avatar_id: str, image_path: str):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        processed_path = f"/tmp/avatars/{avatar_id}_processed.jpg"
+        # Honor the actual system temp dir instead of hardcoding /tmp.
+        processed_dir = Path(tempfile.gettempdir()) / "avatars"
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        processed_path = str(processed_dir / f"{avatar_id}_processed.jpg")
         result_path, metadata = loop.run_until_complete(
             avatar_processor.process_image(image_path, processed_path)
         )
@@ -70,7 +75,6 @@ def generate_video_task(self, session_id: str, text: str, avatar_image_path: str
         logger.info(f"Generating video for session {session_id}")
 
         import asyncio
-        import tempfile
 
         from app.services.animator import avatar_animator
         from app.services.tts import tts_service
@@ -78,12 +82,15 @@ def generate_video_task(self, session_id: str, text: str, avatar_image_path: str
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        # Generate speech audio
-        audio_path = tempfile.mktemp(suffix=".wav")
-        loop.run_until_complete(tts_service.synthesize(text, audio_path))
+        # mkstemp creates the file atomically with owner-only perms (0600) —
+        # mktemp only returned a name, leaving a TOCTOU race and world-readable
+        # output. We close the fds immediately; the services write to the paths.
+        afd, audio_path = tempfile.mkstemp(suffix=".wav")
+        vfd, video_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(afd)
+        os.close(vfd)
 
-        # Generate animation
-        video_path = tempfile.mktemp(suffix=".mp4")
+        loop.run_until_complete(tts_service.synthesize(text, audio_path))
         loop.run_until_complete(avatar_animator.animate(avatar_image_path, audio_path, video_path))
 
         loop.close()
@@ -101,28 +108,57 @@ def generate_video_task(self, session_id: str, text: str, avatar_image_path: str
 
 @celery_app.task(name="cleanup_old_files")
 def cleanup_old_files_task():
-    """Background task to cleanup old temporary files older than 24 hours"""
-    try:
-        cleanup_dirs = ["/tmp/avatars", "/tmp/videos", "/tmp/audio"]
-        max_age_seconds = 24 * 60 * 60  # 24 hours
-        now = time.time()
-        total_cleaned = 0
+    """Reap temp media older than 24h that a dropped/abandoned session left behind.
 
-        for dir_path in cleanup_dirs:
-            directory = Path(dir_path)
+    The WebSocket pipeline writes per-turn audio/video into per-session dirs
+    named ``avatar-session-<id>/`` under the system temp dir, and caches avatar
+    images under ``avatars/`` there too — NOT the hardcoded ``/tmp/{avatars,
+    videos,audio}`` this task used to scan. On a host where ``gettempdir()``
+    isn't ``/tmp`` (or just because those dirs never existed) the old globs
+    matched nothing and the real temp media leaked forever. Sweep the actual
+    locations, oldest-first, and prune now-empty session dirs.
+    """
+    import shutil
+
+    tmpdir = Path(tempfile.gettempdir())
+    max_age_seconds = 24 * 60 * 60  # 24 hours
+    now = time.time()
+    total_cleaned = 0
+    dirs_removed = 0
+
+    try:
+        # Per-session working dirs (input audio + per-chunk wav/mp4).
+        for session_dir in tmpdir.glob("avatar-session-*"):
+            if not session_dir.is_dir():
+                continue
+            # Snapshot the dir's mtime BEFORE deleting anything — unlinking a
+            # child bumps the parent's mtime to now, which would otherwise make
+            # a long-dead dir look freshly active and never get pruned.
+            dir_stale = now - session_dir.stat().st_mtime > max_age_seconds
+            for file_path in session_dir.rglob("*"):
+                if file_path.is_file() and now - file_path.stat().st_mtime > max_age_seconds:
+                    file_path.unlink(missing_ok=True)
+                    total_cleaned += 1
+            # Drop the session dir once it's empty and was itself stale — its
+            # owning websocket is long gone.
+            if dir_stale and not any(session_dir.iterdir()):
+                shutil.rmtree(session_dir, ignore_errors=True)
+                dirs_removed += 1
+
+        # Cached avatar images + any legacy flat dirs that might still exist.
+        for sub in ("avatars", "videos", "audio"):
+            directory = tmpdir / sub
             if not directory.exists():
                 continue
-
             for file_path in directory.iterdir():
-                if file_path.is_file():
-                    file_age = now - file_path.stat().st_mtime
-                    if file_age > max_age_seconds:
-                        file_path.unlink()
-                        total_cleaned += 1
-                        logger.debug(f"Cleaned up: {file_path}")
+                if file_path.is_file() and now - file_path.stat().st_mtime > max_age_seconds:
+                    file_path.unlink(missing_ok=True)
+                    total_cleaned += 1
 
-        logger.info(f"Cleanup completed: {total_cleaned} files removed")
-        return {"cleaned_files": total_cleaned}
+        logger.info(
+            f"Cleanup completed: {total_cleaned} file(s), {dirs_removed} session dir(s) removed"
+        )
+        return {"cleaned_files": total_cleaned, "dirs_removed": dirs_removed}
 
     except Exception as e:
         logger.error(f"Cleanup task failed: {e}")

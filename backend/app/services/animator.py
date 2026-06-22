@@ -169,8 +169,16 @@ class AvatarAnimator:
                 + "\n"
             )
 
-            proc.stdin.write(job.encode())
-            await proc.stdin.drain()
+            # If the worker died (OOM/segfault) its stdin is closed; writing
+            # raises BrokenPipeError. Reset the handle so the NEXT job respawns
+            # a fresh worker instead of repeatedly failing against a dead pipe.
+            try:
+                proc.stdin.write(job.encode())
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                proc.kill()
+                self._worker_proc = None
+                raise RuntimeError(f"MuseTalk worker pipe is dead: {e}") from e
 
             # GPU: expect ~5-15s per sentence; CPU: up to 5 min
             infer_timeout = 60 if self.device == "cuda" else 300
@@ -180,6 +188,13 @@ class AvatarAnimator:
                 proc.kill()
                 self._worker_proc = None
                 raise RuntimeError(f"MuseTalk inference timed out after {infer_timeout}s")
+
+            # Empty read == worker exited mid-job (EOF on stdout). Reset so the
+            # next call respawns instead of erroring on a half-dead process.
+            if not result_line:
+                proc.kill()
+                self._worker_proc = None
+                raise RuntimeError("MuseTalk worker exited before returning a result")
 
             result = json.loads(result_line.decode().strip())
             if result["status"] != "ok":

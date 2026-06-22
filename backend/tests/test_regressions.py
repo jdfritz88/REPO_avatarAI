@@ -167,3 +167,37 @@ async def test_avatar_metadata_patch_actually_persists(
     assert (fresh.avatar_metadata or {}).get("system_prompt") == "You are a pirate."
     # And the pre-existing keys were merged, not clobbered
     assert (fresh.avatar_metadata or {}).get("face_detected") is True
+
+
+def test_cleanup_task_sweeps_session_dirs(tmp_path, monkeypatch):
+    """cleanup_old_files must reap the avatar-session-* dirs the WS pipeline
+    actually writes to — not just the legacy /tmp/{avatars,videos,audio}."""
+    import time as _time
+
+    import app.celery_app as celery_mod
+
+    # Redirect the system temp dir to an isolated tmp_path for this test.
+    monkeypatch.setattr(celery_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    old = tmp_path / "avatar-session-abc123"
+    old.mkdir()
+    stale_file = old / "0_video.mp4"
+    stale_file.write_bytes(b"x")
+    # Backdate the file and dir well past the 24h threshold.
+    past = _time.time() - 48 * 3600
+    import os as _os
+
+    _os.utime(stale_file, (past, past))
+    _os.utime(old, (past, past))
+
+    # A fresh session dir must be left alone.
+    fresh = tmp_path / "avatar-session-fresh"
+    fresh.mkdir()
+    (fresh / "0_video.mp4").write_bytes(b"y")
+
+    result = celery_mod.cleanup_old_files_task()
+
+    assert result["cleaned_files"] >= 1
+    assert not stale_file.exists()
+    assert not old.exists()  # empty + stale dir pruned
+    assert fresh.exists()  # recent dir untouched
