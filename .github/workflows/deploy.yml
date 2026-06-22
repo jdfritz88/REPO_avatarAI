@@ -1,9 +1,14 @@
 name: Deploy
 
+# Manual-only. This pushes to ECR and runs `aws ecs update-service` against an
+# `avatar-cluster` / `avatar-backend` / `avatar-frontend` that the Terraform in
+# infrastructure/ does NOT yet create — so firing it automatically on every
+# `v*` tag (alongside release.yml, which publishes the GHCR images people
+# actually use) would guarantee a failed run and a noisy failure notification.
+# Trigger it by hand once the ECS cluster + services exist and the AWS_*
+# secrets are configured.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 env:
   AWS_REGION: us-east-1
