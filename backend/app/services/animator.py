@@ -83,6 +83,32 @@ class AvatarAnimator:
 
         self._initialised = True
 
+    def _resolve_worker_script(self, musetalk_dir: Path) -> Path:
+        """
+        Locate the persistent-worker script.
+
+        `musetalk_worker.py` is OUR custom driver, not part of the upstream
+        MuseTalk repo that setup_musetalk.sh clones — so a fresh clone won't
+        have it under models/MuseTalk/scripts/. We ship a tracked copy at
+        backend/musetalk_worker.py and prefer whichever exists, so MuseTalk
+        works even if setup hasn't copied the file into the clone yet.
+        The process still runs with cwd=musetalk_dir + PYTHONPATH set to the
+        clone, so its `from musetalk.utils …` imports resolve regardless of
+        where the script file physically lives.
+        """
+        in_clone = musetalk_dir / "scripts" / "musetalk_worker.py"
+        if in_clone.exists():
+            return in_clone
+        # backend/app/services/animator.py → backend/musetalk_worker.py
+        tracked = Path(__file__).resolve().parent.parent.parent / "musetalk_worker.py"
+        if tracked.exists():
+            logger.info(f"Using tracked MuseTalk worker at {tracked}")
+            return tracked
+        raise FileNotFoundError(
+            f"musetalk_worker.py not found in {in_clone} or {tracked}. "
+            "Re-run scripts/setup_musetalk.sh."
+        )
+
     def _find_dir(self, config_path: str, marker_file: str) -> Optional[Path]:
         candidates = [
             Path(config_path),
@@ -101,7 +127,7 @@ class AvatarAnimator:
             return self._worker_proc
 
         musetalk_dir: Path = self._musetalk_dir  # type: ignore[assignment]
-        worker_script = musetalk_dir / "scripts" / "musetalk_worker.py"
+        worker_script = self._resolve_worker_script(musetalk_dir)
 
         logger.info("Starting persistent MuseTalk worker (loading models once)…")
         proc = await asyncio.create_subprocess_exec(

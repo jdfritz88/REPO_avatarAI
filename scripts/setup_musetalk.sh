@@ -147,6 +147,24 @@ def get_bbox_range(img_list, upperbondrange=0):
 PYEOF
 echo "  preprocessing.py replaced ✓"
 
+# ── 3b. Install our custom persistent worker ────────────────────────────────
+# musetalk_worker.py is OUR driver (loads the models once and serves inference
+# jobs over stdin/stdout), not part of upstream MuseTalk — so the git clone
+# above doesn't include it. Copy the tracked copy from the backend into the
+# clone's scripts/ dir. The backend can also run it from its tracked location,
+# but copying keeps everything self-contained under the MuseTalk repo.
+echo ""
+echo "[3b/5] Installing persistent MuseTalk worker (musetalk_worker.py)..."
+WORKER_SRC="$BACKEND_DIR/musetalk_worker.py"
+WORKER_DST="$MUSETALK_DIR/scripts/musetalk_worker.py"
+if [ -f "$WORKER_SRC" ]; then
+  cp "$WORKER_SRC" "$WORKER_DST"
+  echo "  musetalk_worker.py installed ✓"
+else
+  echo "  ERROR: $WORKER_SRC not found — is the repo checkout complete?" >&2
+  exit 1
+fi
+
 # ── 4. Download model weights from HuggingFace ──────────────────────────────
 echo ""
 echo "[4/5] Downloading MuseTalk model weights (~8.8 GB total)..."
@@ -235,6 +253,13 @@ if [ ! -f "$MUSETALK_DIR/scripts/inference.py" ]; then
   MISSING=1
 else
   echo "  scripts/inference.py ✓"
+fi
+
+if [ ! -f "$MUSETALK_DIR/scripts/musetalk_worker.py" ]; then
+  echo "  MISSING: scripts/musetalk_worker.py"
+  MISSING=1
+else
+  echo "  scripts/musetalk_worker.py ✓"
 fi
 
 if [ ! -f "$MUSETALK_DIR/models/musetalkV15/unet.pth" ]; then
