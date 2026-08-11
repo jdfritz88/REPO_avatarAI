@@ -20,6 +20,9 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
   created_at: string
+  // Set only for multi-agent turns — see SpeakerTag.
+  participant_id?: string
+  participant_name?: string
 }
 
 export interface SessionSummary {
@@ -44,20 +47,45 @@ export type WsMessageType =
   | 'tts_fallback'
   | 'interrupted'
 
+// Speaker attribution — present only on events from a multi-agent turn
+// (Session has active `participants` configured); absent/undefined on the
+// original single-LLM pipeline, so existing single-avatar chats render
+// exactly as before with no speaker label.
+export interface SpeakerTag {
+  participant_id?: string
+  participant_name?: string
+}
+
 // Discriminated union — each WS event has a well-typed payload so the handler
 // can rely on field presence without optional-chaining everywhere.
 export type WsMessage =
   | { type: 'token'; token: string }
   | { type: 'transcription'; text: string }
-  | { type: 'message'; role: 'assistant'; content: string }
-  | { type: 'video_chunk_start'; total_chunks: number }
-  | { type: 'video_chunk'; chunk_index: number; total_chunks: number; video_url: string; text: string }
-  | { type: 'video_chunk_end'; sent_chunks: number }
+  | ({ type: 'message'; role: 'assistant'; content: string } & SpeakerTag)
+  | ({ type: 'video_chunk_start'; total_chunks: number } & SpeakerTag)
+  | ({
+      type: 'video_chunk'
+      chunk_index: number
+      total_chunks: number
+      video_url: string
+      text: string
+    } & SpeakerTag)
+  | ({ type: 'video_chunk_end'; sent_chunks: number } & SpeakerTag)
   | { type: 'status'; message: string; stage?: string }
-  | { type: 'error'; message: string }
+  | ({ type: 'error'; message: string } & SpeakerTag)
   | { type: 'pong' }
   | { type: 'tts_fallback'; engine: string; voice_cloned: boolean; message: string }
   | { type: 'interrupted'; message: string }
+
+// A selectable multi-agent participant (GET /api/v1/llm/participants).
+export interface Participant {
+  id: string
+  type: 'anthropic' | 'openai_compat' | 'kindroid'
+  name: string
+  model: string | null
+}
+
+export type TurnMode = 'round_robin' | 'human_directed' | 'free_form'
 
 export interface VoiceApiResponse {
   id: string

@@ -12,7 +12,7 @@ from jose import JWTError, jwt
 from prometheus_fastapi_instrumentator import Instrumentator
 from sqlalchemy import select, text
 
-from app.api.v1 import avatars, conversations, messages, sessions, users, voices
+from app.api.v1 import avatars, conversations, llm, messages, sessions, users, voices
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine
 from app.logging_config import configure_logging
@@ -156,6 +156,7 @@ app.include_router(sessions.router, prefix="/api/v1/sessions", tags=["sessions"]
 app.include_router(conversations.router, prefix="/api/v1/conversations", tags=["conversations"])
 app.include_router(messages.router, prefix="/api/v1/messages", tags=["messages"])
 app.include_router(voices.router, prefix="/api/v1/voices", tags=["voices"])
+app.include_router(llm.router, prefix="/api/v1/llm", tags=["llm"])
 
 
 @app.exception_handler(Exception)
@@ -371,6 +372,36 @@ async def websocket_endpoint(
             elif msg_type == "set_language":
                 lang = data.get("language", "en")
                 await websocket_manager.set_language(session_id, lang)
+
+            elif msg_type == "set_participants":
+                participant_ids = data.get("participant_ids")
+                if not isinstance(participant_ids, list):
+                    await websocket_manager.send_message(
+                        session_id, {"type": "error", "message": "participant_ids must be a list"}
+                    )
+                    continue
+                await websocket_manager.set_participants(session_id, participant_ids)
+
+            elif msg_type == "set_turn_mode":
+                mode = data.get("mode")
+                if mode not in ("round_robin", "human_directed", "free_form"):
+                    await websocket_manager.send_message(
+                        session_id, {"type": "error", "message": "Invalid turn mode"}
+                    )
+                    continue
+                await websocket_manager.set_turn_mode(session_id, mode)
+
+            elif msg_type == "set_addressing":
+                await websocket_manager.set_addressing(session_id, bool(data.get("enabled", True)))
+
+            elif msg_type == "select_next_speaker":
+                participant_id = data.get("participant_id")
+                if not participant_id or not isinstance(participant_id, str):
+                    await websocket_manager.send_message(
+                        session_id, {"type": "error", "message": "Missing participant_id"}
+                    )
+                    continue
+                await websocket_manager.set_next_speaker(session_id, participant_id)
 
             elif msg_type == "ping":
                 await websocket_manager.send_message(session_id, {"type": "pong"})

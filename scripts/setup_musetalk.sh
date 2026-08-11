@@ -11,6 +11,9 @@ VENV_PYTHON="$BACKEND_DIR/venv/bin/python"
 SENTINEL="$PROJECT_ROOT/.musetalk_ready"
 
 if [ ! -f "$VENV_PYTHON" ]; then
+  VENV_PYTHON="$BACKEND_DIR/venv/Scripts/python.exe"
+fi
+if [ ! -f "$VENV_PYTHON" ]; then
   VENV_PYTHON="python3"
 fi
 
@@ -37,9 +40,7 @@ echo "[2/5] Installing MuseTalk requirements..."
 # Install requirements, skipping packages incompatible with Python 3.12
 # (mmpose/mmcv have no 3.12 wheels; tensorflow is optional for our use case)
 "$VENV_PYTHON" -m pip install -q \
-  "diffusers==0.32.2" \
   "accelerate==0.28.0" \
-  "transformers==4.39.2" \
   "opencv-python==4.9.0.80" \
   "soundfile==0.12.1" \
   "librosa==0.11.0" \

@@ -47,6 +47,14 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     ELEVENLABS_API_KEY: Optional[str] = None
 
+    # Multi-agent participants — Mistral (direct + OpenRouter proxy). Kindroid
+    # kins are NOT declared here: they're auto-discovered from any
+    # KINDROID_<NAME>_API_KEY / KINDROID_<NAME>_AI_ID pair in the environment
+    # (see app/services/participants.py), so adding a kin is just two new
+    # .env lines with no code change.
+    MISTRAL_API_KEY: str = ""
+    OPENROUTER_API_KEY: str = ""
+
     # Point the OpenAI-compatible client at a different server — Ollama
     # (http://localhost:11434/v1), vLLM, LM Studio, OpenRouter, etc.
     # Used when LLM_PROVIDER is "openai" or "ollama".
@@ -170,6 +178,12 @@ class Settings(BaseSettings):
     model_config = {
         "env_file": _ENV_FILE,
         "case_sensitive": True,
+        # Kindroid kins are dynamically-named (KINDROID_<NAME>_API_KEY/_AI_ID,
+        # read directly from os.environ by app/services/participants.py) so
+        # they can't be declared as static fields here — pydantic-settings
+        # defaults to forbidding undeclared env vars, so this must be
+        # explicit or loading .env raises on the very first kin added.
+        "extra": "ignore",
     }
 
 

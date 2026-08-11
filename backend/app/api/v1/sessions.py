@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.users import get_current_user
 from app.database import get_db
 from app.models import Avatar, Message, Session, User
-from app.schemas import SessionCreate, SessionResponse
+from app.schemas import SessionCreate, SessionResponse, SessionSettingsUpdate
 from app.websocket import websocket_manager
 
 logger = logging.getLogger(__name__)
@@ -121,6 +121,60 @@ async def get_session(
         logger.error(f"Failed to get session: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to get session"
+        )
+
+
+@router.patch("/{session_id}/settings", response_model=SessionResponse)
+async def update_session_settings(
+    session_id: str,
+    payload: SessionSettingsUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user),
+):
+    """
+    Merge an allowlist of multi-agent settings (active participants, turn
+    mode, addressing toggle) into `Session.settings`. Used both to set
+    participants before the WebSocket opens (session-start picker) and to
+    change them mid-conversation — if a WS connection for this session is
+    already live, the new settings are pushed into it immediately so the
+    caller doesn't need to reconnect for the change to take effect.
+    """
+    try:
+        result = await db.execute(select(Session).where(Session.id == session_id))
+        session = result.scalar_one_or_none()
+        if not session:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        if session.user_id != _user_id(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorised to modify this session",
+            )
+
+        existing: dict = session.settings or {}
+        update_data = payload.model_dump(exclude_unset=True)
+        # Reassign a NEW dict — mutating the ORM-held dict in place defeats
+        # SQLAlchemy's change detection (same pattern as avatar_metadata).
+        session.settings = {**existing, **update_data}
+        await db.commit()
+        await db.refresh(session)
+
+        if "participant_ids" in update_data:
+            await websocket_manager.set_participants(session_id, update_data["participant_ids"])
+        if "turn_mode" in update_data:
+            await websocket_manager.set_turn_mode(session_id, update_data["turn_mode"])
+        if "addressing_enabled" in update_data:
+            await websocket_manager.set_addressing(session_id, update_data["addressing_enabled"])
+
+        logger.info(f"Session {session_id} settings updated: {list(update_data.keys())}")
+        return session
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Failed to update settings for session {session_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update session settings",
         )
 
 

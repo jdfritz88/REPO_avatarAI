@@ -14,7 +14,8 @@ from typing import Dict, List, Optional
 from fastapi import WebSocket
 
 from app.services.animator import avatar_animator
-from app.services.llm import llm_service
+from app.services.llm import LLMError, build_llm_client, llm_service
+from app.services.participants import ParticipantConfig, get_participant
 from app.services.storage import storage_service
 from app.services.stt import stt_service
 from app.services.tts import tts_service
@@ -76,6 +77,34 @@ _MAX_CHUNK_CHARS = 200
 # (better TTS prosody than trailing a bare clause).
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 _CLAUSE_RE = re.compile(r"(?<=[.!?,;:—])\s+")
+
+# Address / cut-in markers ("@Silva" / "#Silva") — the symbol is a silent
+# routing signal (never spoken), the name after it is spoken normally.
+_ADDRESS_RE = re.compile(r"[@#](\w+)")
+_ADDRESS_SYMBOL_RE = re.compile(r"[@#](?=\w)")
+
+
+def _detect_address(text: str, candidates: List["ParticipantConfig"]) -> Optional[str]:
+    """
+    Scan `text` for an "@Name"/"#Name" mention matching one of `candidates`
+    (case-insensitive, matched against each participant's display name,
+    spaces ignored so "@JordanKin" matches "Jordan Kin"). Returns the first
+    matching participant's id, or None.
+    """
+    mentions = {m.group(1).lower() for m in _ADDRESS_RE.finditer(text)}
+    if not mentions:
+        return None
+    for participant in candidates:
+        key = participant.name.replace(" ", "").lower()
+        if key in mentions:
+            return participant.id
+    return None
+
+
+def _strip_address_markers(text: str) -> str:
+    """Remove the `@`/`#` symbol only, leaving the name so TTS speaks it
+    naturally as part of the sentence."""
+    return _ADDRESS_SYMBOL_RE.sub("", text)
 
 
 def _drain_chunks(buf: str, sep_re: "re.Pattern[str]", min_len: int, max_len: int):
@@ -162,6 +191,12 @@ class ConnectionManager:
             "user_id": user_id,
             "connected_at": datetime.now(timezone.utc),
             "last_activity": datetime.now(timezone.utc),
+            # Multi-agent — empty participants list means "legacy single-LLM
+            # mode" (the original app behavior, unchanged).
+            "participants": [],
+            "turn_mode": "round_robin",
+            "addressing_enabled": True,
+            "next_speaker_id": None,
         }
         await self._load_session_data(session_id)
         logger.info(f"WebSocket connected: {session_id} (user={user_id})")
@@ -189,6 +224,27 @@ class ConnectionManager:
                 # Trust DB owner over caller-supplied claim
                 if session.user_id:
                     self.session_data[session_id]["user_id"] = session.user_id
+
+                # Seed multi-agent config from session.settings (set via
+                # PATCH /api/v1/sessions/{id}/settings — see sessions.py).
+                # Previously this column was written-only; this is the read
+                # side that makes it do something.
+                settings_json = session.settings or {}
+                if isinstance(settings_json, str):
+                    try:
+                        settings_json = json.loads(settings_json)
+                    except Exception:
+                        settings_json = {}
+                participant_ids = settings_json.get("participant_ids")
+                if participant_ids:
+                    resolved = [get_participant(pid) for pid in participant_ids]
+                    self.session_data[session_id]["participants"] = [p for p in resolved if p]
+                if settings_json.get("turn_mode"):
+                    self.session_data[session_id]["turn_mode"] = settings_json["turn_mode"]
+                if "addressing_enabled" in settings_json:
+                    self.session_data[session_id]["addressing_enabled"] = bool(
+                        settings_json["addressing_enabled"]
+                    )
 
                 # Rehydrate the LLM context window from persisted messages so
                 # a reconnect (refresh, network blip, etc.) resumes the same
@@ -370,11 +426,20 @@ class ConnectionManager:
         role: str,
         content: str,
         latency: Optional[float] = None,
+        participant: Optional["ParticipantConfig"] = None,
     ) -> None:
         """Best-effort persist a message; failure must not break the chat pipeline."""
         try:
             from app.database import AsyncSessionLocal
             from app.models import Message
+
+            metadata = None
+            if participant is not None:
+                metadata = {
+                    "participant_id": participant.id,
+                    "participant_name": participant.name,
+                    "participant_type": participant.type,
+                }
 
             async with AsyncSessionLocal() as db:
                 db.add(
@@ -384,6 +449,7 @@ class ConnectionManager:
                         content=content,
                         content_type="text",
                         latency=latency,
+                        message_metadata=metadata,
                     )
                 )
                 await db.commit()
@@ -551,6 +617,145 @@ class ConnectionManager:
         self._spawn_turn(session_id, self._handle_text_input_inner(session_id, text))
 
     async def _handle_text_input_inner(self, session_id: str, text: str):
+        """
+        Dispatcher: sessions with active multi-agent participants configured
+        (via PATCH .../settings or the set_participants WS message) run the
+        round-based multi-agent pipeline; everyone else gets the original
+        single-global-LLM pipeline unchanged.
+        """
+        data = self.session_data.get(session_id, {})
+        if data.get("participants"):
+            await self._handle_multi_agent_turn(session_id, text)
+        else:
+            await self._handle_text_input_inner_legacy(session_id, text)
+
+    async def _handle_multi_agent_turn(self, session_id: str, text: str) -> None:
+        started_at = datetime.now(timezone.utc)
+        data = self.session_data.get(session_id, {})
+        data["last_activity"] = started_at
+
+        try:
+            await self._persist_message(session_id, "user", text)
+            await self._ensure_conversation_title(session_id, text)
+            await self.send_message(
+                session_id, {"type": "status", "message": "Thinking…", "stage": "llm"}
+            )
+            with span("chat.turn", **{"input_chars": len(text), "mode": "multi_agent"}):
+                await self._run_round(session_id, text)
+        except Exception as e:
+            logger.error(f"Multi-agent turn error [{session_id}]: {e}")
+            await self.send_message(session_id, {"type": "error", "message": "Processing failed"})
+
+    async def _run_round(self, session_id: str, human_text: str) -> None:
+        """
+        Core multi-agent orchestration. `round_robin`: every active
+        participant responds in fixed order, each seeing the human message
+        plus every earlier response in *this* round. `human_directed`: only
+        `next_speaker_id` responds. `free_form`: one pass over all
+        participants, each may decline by replying exactly "[PASS]".
+
+        Addressing cut-in (round_robin + addressing_enabled only): if a
+        participant's response contains "@Name"/"#Name" for another active
+        participant, that participant is inserted as the immediate next
+        speaker, then the fixed order resumes from where it left off.
+        """
+        data = self.session_data.get(session_id, {})
+        participants: List["ParticipantConfig"] = data.get("participants", [])
+        mode = data.get("turn_mode", "round_robin")
+        addressing_enabled = data.get("addressing_enabled", True)
+        system_prompt = data.get("system_prompt") or ""
+
+        round_transcript: List[dict] = [{"speaker": "Human", "content": human_text}]
+
+        if mode == "human_directed":
+            next_id = data.get("next_speaker_id")
+            order = [p for p in participants if p.id == next_id] or participants[:1]
+        else:
+            order = list(participants)
+
+        responded_ids: set = set()
+        idx = 0
+        while idx < len(order):
+            participant = order[idx]
+            idx += 1
+            if participant.id in responded_ids:
+                continue  # already spoke this round (e.g. addressed twice)
+
+            prompt = system_prompt
+            if mode == "free_form":
+                prompt = (
+                    prompt
+                    + " If you have nothing to add to this conversation right now,"
+                    " reply with exactly: [PASS]"
+                ).strip()
+
+            try:
+                client = build_llm_client(participant)
+                with span(
+                    "llm.turn", **{"participant": participant.id, "history_len": len(round_transcript)}
+                ):
+                    text = await client.turn(round_transcript, prompt or None)
+            except LLMError as e:
+                logger.error(f"Participant {participant.id} turn failed [{session_id}]: {e}")
+                await self.send_message(
+                    session_id,
+                    {"type": "error", "message": f"{participant.name} failed to respond: {e}"},
+                )
+                continue
+
+            if mode == "free_form" and text.strip().startswith("[PASS]"):
+                continue
+
+            responded_ids.add(participant.id)
+            round_transcript.append({"speaker": participant.name, "content": text})
+            await self._persist_message(session_id, "assistant", text, participant=participant)
+
+            addressed_id = None
+            if mode == "round_robin" and addressing_enabled:
+                others = [p for p in participants if p.id != participant.id]
+                addressed_id = _detect_address(text, others)
+
+            spoken_text = _strip_address_markers(text)
+            await self._speak_participant_turn(session_id, spoken_text, participant)
+
+            if addressed_id and addressed_id not in responded_ids:
+                addressed = next((p for p in participants if p.id == addressed_id), None)
+                if addressed:
+                    order.insert(idx, addressed)
+                    logger.info(f"Address cut-in [{session_id}]: {participant.id} -> {addressed_id}")
+
+    async def _speak_participant_turn(
+        self, session_id: str, text: str, participant: "ParticipantConfig"
+    ) -> None:
+        """
+        Run one participant's already-complete response text through the
+        existing sentence-chunked TTS/animation pipeline (`_animate_from_queue`,
+        unchanged) tagged with that participant's identity, so the frontend
+        can attribute the bubble/video to the right speaker.
+        """
+        await self.send_message(
+            session_id,
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": text,
+                "participant_id": participant.id,
+                "participant_name": participant.name,
+            },
+        )
+
+        queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
+        chunks, remainder = _drain_chunks(text, _SENTENCE_RE, _MIN_SENTENCE_LEN, _MAX_CHUNK_CHARS)
+        for chunk in chunks:
+            await queue.put(chunk)
+        tail = remainder.strip()
+        if tail:
+            await queue.put(tail)
+        await queue.put(None)
+
+        await self._animate_from_queue(session_id, queue, participant=participant)
+
+    async def _handle_text_input_inner_legacy(self, session_id: str, text: str):
         started_at = datetime.now(timezone.utc)
 
         try:
@@ -669,15 +874,24 @@ class ConnectionManager:
         self,
         session_id: str,
         queue: "asyncio.Queue[Optional[str]]",
+        participant: Optional["ParticipantConfig"] = None,
     ) -> None:
         """
         Consume sentences from the queue and run TTS + animation for each,
         streaming video_chunk events to the frontend as they complete.
+        `participant` tags every emitted event with who's speaking (multi-
+        agent turns) — None (the default) reproduces the original single-LLM
+        behavior exactly, with no participant fields on the payloads.
         """
         data = self.session_data.get(session_id, {})
         avatar_image = data.get("avatar_image_local")
         speaker_wav: Optional[str] = data.get("voice_wav")
         language: str = data.get("language", "en")
+        speaker_tag: dict = (
+            {"participant_id": participant.id, "participant_name": participant.name}
+            if participant is not None
+            else {}
+        )
 
         # If no avatar image, drain queue silently
         if not avatar_image:
@@ -699,6 +913,7 @@ class ConnectionManager:
             {
                 "type": "video_chunk_start",
                 "total_chunks": -1,  # streaming mode — total unknown up front
+                **speaker_tag,
             },
         )
 
@@ -779,6 +994,7 @@ class ConnectionManager:
                         "total_chunks": -1,
                         "video_url": video_url,
                         "text": sentence,
+                        **speaker_tag,
                     },
                 )
                 chunk_index = chunk_index + 1
@@ -797,13 +1013,14 @@ class ConnectionManager:
             {
                 "type": "video_chunk_end",
                 "sent_chunks": chunk_index,
+                **speaker_tag,
             },
         )
 
         if not sent_any:
             await self.send_message(
                 session_id,
-                {"type": "error", "message": "Avatar animation failed for all sentences."},
+                {"type": "error", "message": "Avatar animation failed for all sentences.", **speaker_tag},
             )
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -876,6 +1093,43 @@ class ConnectionManager:
         if session_id in self.session_data:
             self.session_data[session_id]["language"] = lang
             logger.info(f"Language set [{session_id}]: {lang}")
+
+    # ── multi-agent session config ──────────────────────────────────────────
+
+    async def set_participants(self, session_id: str, participant_ids: List[str]) -> None:
+        """
+        Set the active multi-agent participants for a session. Unknown ids
+        are silently dropped (rather than erroring the whole call) so one
+        stale/mistyped id in a list doesn't block the valid ones — matches
+        the lenient-mutation style of set_voice_by_id/set_language.
+        """
+        if session_id not in self.session_data:
+            return
+        resolved = [get_participant(pid) for pid in participant_ids]
+        self.session_data[session_id]["participants"] = [p for p in resolved if p]
+        logger.info(
+            f"Participants set [{session_id}]: "
+            f"{[p.id for p in self.session_data[session_id]['participants']]}"
+        )
+
+    async def set_turn_mode(self, session_id: str, mode: str) -> None:
+        if mode not in ("round_robin", "human_directed", "free_form"):
+            return
+        if session_id in self.session_data:
+            self.session_data[session_id]["turn_mode"] = mode
+            logger.info(f"Turn mode set [{session_id}]: {mode}")
+
+    async def set_addressing(self, session_id: str, enabled: bool) -> None:
+        if session_id in self.session_data:
+            self.session_data[session_id]["addressing_enabled"] = bool(enabled)
+            logger.info(f"Addressing set [{session_id}]: {bool(enabled)}")
+
+    async def set_next_speaker(self, session_id: str, participant_id: str) -> None:
+        """human_directed mode only — which participant responds to the
+        next human message."""
+        if session_id in self.session_data:
+            self.session_data[session_id]["next_speaker_id"] = participant_id
+            logger.info(f"Next speaker set [{session_id}]: {participant_id}")
 
     # ── stale session cleanup ─────────────────────────────────────────────────
 

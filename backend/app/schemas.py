@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -103,6 +103,20 @@ class ConversationResponse(BaseModel):
 
 class AvatarRename(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
+
+
+class SessionSettingsUpdate(BaseModel):
+    """Allowed editable fields for a session's multi-agent settings (JSON
+    column `Session.settings`, previously written-only). Restrict to a known
+    allowlist for the same reason as `AvatarMetadataUpdate` below — users
+    shouldn't be able to stuff arbitrary keys into the JSON column.
+    """
+
+    participant_ids: Optional[List[str]] = Field(default=None, max_length=16)
+    turn_mode: Optional[Literal["round_robin", "human_directed", "free_form"]] = None
+    addressing_enabled: Optional[bool] = None
+
+    model_config = {"extra": "forbid"}
 
 
 class AvatarMetadataUpdate(BaseModel):

@@ -5,6 +5,12 @@ frontend/node_modules/
 venv/
 env/
 
+# Portable Redis-compatible server (downloaded, not app code)
+redis-portable/
+
+# Local Claude Code session state (not app code)
+.claude/
+
 # Environment
 .env
 .env.local

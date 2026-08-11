@@ -22,12 +22,15 @@ appropriate user-facing messages.
 from __future__ import annotations
 
 import logging
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional
 
 import anthropic
 import openai
 
 from app.config import settings
+
+if TYPE_CHECKING:
+    from app.services.participants import ParticipantConfig
 
 logger = logging.getLogger(__name__)
 
@@ -98,11 +101,26 @@ def _map_openai_exception(exc: Exception) -> LLMError:
 
 
 class LLMService:
-    """LLM Service for AI responses."""
+    """
+    LLM Service for AI responses.
 
-    def __init__(self):
-        self.provider = settings.LLM_PROVIDER
-        self.model = settings.LLM_MODEL
+    With no arguments, reads the single global provider/model from `settings`
+    (the original behavior — used for the app's default non-multi-agent
+    chat). Pass `provider`/`model`/`api_key`/`base_url` explicitly to build a
+    one-off client for a specific multi-agent participant instead — see
+    `build_llm_client()` below, which is the normal way callers outside this
+    module should construct participant-specific instances.
+    """
+
+    def __init__(
+        self,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ):
+        self.provider = provider or settings.LLM_PROVIDER
+        self.model = model or settings.LLM_MODEL
         self.temperature = settings.LLM_TEMPERATURE
         self.max_tokens = settings.LLM_MAX_TOKENS
         # Opt-in reasoning cap for OpenAI-compatible "thinking" models (e.g.
@@ -111,23 +129,23 @@ class LLMService:
         self.reasoning_effort = settings.LLM_REASONING_EFFORT or None
 
         if self.provider == "anthropic":
-            self.client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+            self.client = anthropic.AsyncAnthropic(api_key=api_key or settings.ANTHROPIC_API_KEY)
         elif self.provider == "ollama":
             # Ollama (and vLLM / LM Studio / OpenRouter) speak the OpenAI
             # wire protocol — reuse the OpenAI client against their base URL.
             # Fully local and free; no API key required (the client insists
             # on a non-empty string, so we pass a placeholder).
-            base_url = settings.OPENAI_BASE_URL or "http://localhost:11434/v1"
+            resolved_base_url = base_url or settings.OPENAI_BASE_URL or "http://localhost:11434/v1"
             self.client = openai.AsyncOpenAI(
-                api_key=settings.OPENAI_API_KEY or "ollama",
-                base_url=base_url,
+                api_key=api_key or settings.OPENAI_API_KEY or "ollama",
+                base_url=resolved_base_url,
             )
             self.provider = "openai"  # downstream code paths are identical
-            logger.info(f"LLM provider 'ollama' → OpenAI-compatible client at {base_url}")
+            logger.info(f"LLM provider 'ollama' → OpenAI-compatible client at {resolved_base_url}")
         elif self.provider == "openai":
             self.client = openai.AsyncOpenAI(
-                api_key=settings.OPENAI_API_KEY,
-                base_url=settings.OPENAI_BASE_URL,  # None → api.openai.com
+                api_key=api_key or settings.OPENAI_API_KEY,
+                base_url=base_url or settings.OPENAI_BASE_URL,  # None → api.openai.com
             )
 
     # ── non-streaming ────────────────────────────────────────────────────────
@@ -143,6 +161,53 @@ class LLMService:
         if self.provider == "openai":
             return await self._generate_openai(messages, system_prompt)
         raise LLMError(f"Unsupported LLM provider: {self.provider}")
+
+    async def turn(
+        self,
+        round_transcript: List[Dict[str, str]],
+        system_prompt: Optional[str] = None,
+    ) -> str:
+        """
+        Multi-agent entry point — shared shape with `KindroidClient.turn()`
+        so the round-robin orchestrator (app/websocket.py `_run_round`) can
+        call either without caring which provider is behind it.
+
+        `round_transcript` is a chronological list of {"speaker", "content"}
+        covering the human's message plus any earlier participants' replies
+        so far this round. Unlike Kindroid, this client is stateless and
+        genuinely uses the full transcript — each turn becomes a `messages`
+        entry, prefixed with "[Speaker]: " so the model understands it's in
+        a group conversation rather than a private 1:1 chat.
+
+        Every turn maps to role="user", including OTHER AI participants'
+        turns — not role="assistant". This isn't optional stylistic choice:
+        OpenAI-compatible APIs require the message list to end on a
+        user/tool turn before they'll generate the next assistant turn
+        (confirmed against the real Mistral API — a trailing role="assistant"
+        message is rejected with `invalid_request_message_order`). Since
+        this specific call is always this participant's OWN next turn, it
+        has no legitimate prior "assistant" turns of its own in a single
+        round's transcript — everyone else, human or AI, is external input
+        from its perspective.
+        """
+        messages = [
+            {
+                "role": "user",
+                "content": f'[{turn["speaker"]}]: {turn["content"]}',
+            }
+            for turn in round_transcript
+        ]
+        # Models tend to mimic the "[Speaker]: " label pattern they see in
+        # the transcript and prefix their own reply with it too (observed
+        # against the real Mistral API) — tell them not to.
+        group_chat_note = (
+            "You are in a live multi-participant group conversation; each "
+            'prior line is labeled "[Speaker]: " so you know who said what. '
+            "Reply with only your own words — do not prefix your reply with "
+            "your own name or brackets."
+        )
+        combined_prompt = f"{system_prompt}\n\n{group_chat_note}" if system_prompt else group_chat_note
+        return await self.generate_response(messages, combined_prompt)
 
     async def _generate_anthropic(
         self,
@@ -299,6 +364,30 @@ class LLMService:
             )
         except Exception:
             pass
+
+
+def build_llm_client(participant: "ParticipantConfig"):
+    """
+    Build a per-participant client from a `ParticipantConfig`
+    (app.services.participants) — the standard way multi-agent code
+    (app/websocket.py `_run_round`) constructs a provider-specific client
+    for one selected participant. Returns either an `LLMService`
+    (anthropic/openai_compat) or a `KindroidClient`; both expose the shared
+    `.turn(round_transcript, system_prompt)` interface the orchestrator
+    relies on, so callers don't need to know which one they got.
+    """
+    if participant.type == "kindroid":
+        from app.services.kindroid import KindroidClient
+
+        return KindroidClient(api_key=participant.api_key, ai_id=participant.ai_id)
+
+    provider = "anthropic" if participant.type == "anthropic" else "openai"
+    return LLMService(
+        provider=provider,
+        model=participant.model,
+        api_key=participant.api_key,
+        base_url=participant.base_url,
+    )
 
 
 # Global instance

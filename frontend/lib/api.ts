@@ -173,6 +173,29 @@ export const api = {
     return response.data as Blob
   },
 
+  updateSessionSettings: async (
+    sessionId: string,
+    settings: {
+      participant_ids?: string[]
+      turn_mode?: 'round_robin' | 'human_directed' | 'free_form'
+      addressing_enabled?: boolean
+    },
+  ) => {
+    const response = await apiClient.patch(`/api/v1/sessions/${sessionId}/settings`, settings)
+    return response.data
+  },
+
+  // Multi-agent
+  listParticipants: async () => {
+    const response = await apiClient.get('/api/v1/llm/participants')
+    return response.data
+  },
+
+  listMistralModels: async () => {
+    const response = await apiClient.get('/api/v1/llm/mistral-models')
+    return response.data
+  },
+
   // Messages
   sendMessage: async (sessionId: string, content: string) => {
     const response = await apiClient.post('/api/v1/messages/send', {
