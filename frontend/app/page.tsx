@@ -4,6 +4,7 @@ import { useState, type CSSProperties } from 'react'
 import dynamic from 'next/dynamic'
 import { AvatarUpload } from '@/components/AvatarUpload'
 import { AvatarList } from '@/components/AvatarList'
+import { ParticipantPicker } from '@/components/ParticipantPicker'
 import { ConnectionStatus } from '@/components/ui/ConnectionStatus'
 import { ThemeToggle } from '@/components/ui/ThemeToggle'
 import { AuthModal } from '@/components/AuthModal'
@@ -114,6 +115,7 @@ type View = 'home' | 'avatars' | 'chat' | 'voice' | 'history' | 'settings'
 export default function Home() {
   const { isAuthenticated, user, clearAuth } = useStore()
   const [selectedAvatar, setSelectedAvatar] = useState<string | null>(null)
+  const [selectedParticipantIds, setSelectedParticipantIds] = useState<string[]>([])
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
   // Session id to RESUME (set only when opening from history). Distinct from
   // activeSessionId (reported back after a session starts) so it can key the
@@ -328,6 +330,14 @@ export default function Home() {
               />
             </div>
             {selectedAvatar && (
+              <div className="mt-8">
+                <ParticipantPicker
+                  selectedIds={selectedParticipantIds}
+                  onChange={setSelectedParticipantIds}
+                />
+              </div>
+            )}
+            {selectedAvatar && (
               <div className="mt-8 flex justify-center">
                 <button
                   onClick={handleStartChat}
@@ -365,6 +375,7 @@ export default function Home() {
               avatarId={selectedAvatar}
               resumeSessionId={resumeSessionId ?? undefined}
               onSessionCreated={setActiveSessionId}
+              initialParticipantIds={resumeSessionId ? undefined : selectedParticipantIds}
             />
           </div>
         )}

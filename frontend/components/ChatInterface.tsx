@@ -6,12 +6,19 @@ import {
   Sparkles, Clock, Copy, RotateCcw, Wand2,
   MessageCircle, Zap, Activity, Download, Globe,
   Pencil, Trash2, Check, X, Keyboard, Plug, Square,
+  Users, AtSign,
 } from 'lucide-react'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import { toast } from 'react-hot-toast'
 import { api, buildSessionWsUrl } from '@/lib/api'
 import { useStore } from '@/store/useStore'
-import type { Avatar, ChatMessage, WsMessage } from '@/lib/types'
+import type { Avatar, ChatMessage, Participant, TurnMode, WsMessage } from '@/lib/types'
+
+const TURN_MODES: { value: TurnMode; label: string }[] = [
+  { value: 'round_robin', label: 'Round-robin' },
+  { value: 'human_directed', label: 'Human-directed' },
+  { value: 'free_form', label: 'Free-form' },
+]
 
 const WS_AUTH_REJECT_CODE = 4401  // matches backend close code for auth/ownership failure
 const MAX_WS_RECONNECT_ATTEMPTS = 6
@@ -33,6 +40,8 @@ interface Message {
   // real DB id and supports edit/delete). Optimistic locally-created
   // messages don't get the action menu until they're re-fetched.
   persisted?: boolean
+  // Set only for multi-agent turns — which participant said this.
+  participantName?: string
 }
 
 interface VideoChunk {
@@ -47,6 +56,11 @@ interface ChatInterfaceProps {
    *  a fresh one — the backend rehydrates the prior messages on connect. */
   resumeSessionId?: string
   onSessionCreated?: (sessionId: string) => void
+  /** Multi-agent participants selected before starting this session (fresh
+   *  sessions only — a resumed session already has its own persisted
+   *  settings, so this is omitted for resumes). Empty/undefined = the
+   *  original single-avatar pipeline, unchanged. */
+  initialParticipantIds?: string[]
 }
 
 function detectEmotion(text: string): string {
@@ -159,7 +173,9 @@ function IdleAvatar({ imageUrl }: { imageUrl: string | null }) {
   )
 }
 
-export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCreated }: ChatInterfaceProps) {
+export function ChatInterface({
+  avatarId, voiceId, resumeSessionId, onSessionCreated, initialParticipantIds,
+}: ChatInterfaceProps) {
   const setWsConnected = useStore((s) => s.setWsConnected)
 
   const [messages, setMessages] = useState<Message[]>([])
@@ -178,6 +194,20 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const [streamingContent, setStreamingContent] = useState('')
   const [language, setLanguage] = useState('en')
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
+
+  // ── Multi-agent state ────────────────────────────────────────────────────
+  const hasParticipants = !!initialParticipantIds && initialParticipantIds.length > 0
+  const [turnMode, setTurnMode] = useState<TurnMode>('round_robin')
+  const [addressingEnabled, setAddressingEnabled] = useState(true)
+  const [nextSpeakerId, setNextSpeakerId] = useState<string | null>(null)
+  const { data: allParticipants } = useQuery({
+    queryKey: ['participants'],
+    queryFn: api.listParticipants,
+    enabled: hasParticipants,
+  })
+  const activeParticipants: Participant[] = (allParticipants || []).filter((p: Participant) =>
+    initialParticipantIds?.includes(p.id)
+  )
 
   const sendTimeRef = useRef<number>(0)
   const reconnectAttemptsRef = useRef(0)
@@ -338,6 +368,20 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const createSessionMutation = useMutation({
     mutationFn: () => api.createSession(avatarId),
     onSuccess: async (data) => {
+      // Apply multi-agent settings BEFORE opening the WS so the backend's
+      // connect-time session load picks them up immediately (see
+      // app/websocket.py _load_session_data — reads session.settings).
+      if (hasParticipants) {
+        try {
+          await api.updateSessionSettings(data.id, {
+            participant_ids: initialParticipantIds,
+            turn_mode: 'round_robin',
+            addressing_enabled: true,
+          })
+        } catch {
+          toast.error('Could not apply group participants — starting solo chat instead')
+        }
+      }
       setSessionId(data.id)
       sessionIdRef.current = data.id
       createdHereRef.current = true
@@ -435,6 +479,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
           content,
           timestamp: new Date(),
           emotion: detectEmotion(content),
+          participantName: data.participant_name,
         }])
         // Keep isProcessing=true — spinner stays until first video chunk arrives
         break
@@ -579,6 +624,28 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     setLanguage(lang)
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'set_language', language: lang }))
+    }
+  }
+
+  const changeTurnMode = (mode: TurnMode) => {
+    setTurnMode(mode)
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'set_turn_mode', mode }))
+    }
+  }
+
+  const toggleAddressing = () => {
+    const next = !addressingEnabled
+    setAddressingEnabled(next)
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'set_addressing', enabled: next }))
+    }
+  }
+
+  const selectNextSpeaker = (participantId: string) => {
+    setNextSpeakerId(participantId)
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'select_next_speaker', participant_id: participantId }))
     }
   }
 
@@ -859,6 +926,33 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
             </div>
 
             <div className="flex items-center gap-2">
+              {/* Multi-agent controls — only shown when this session has group participants */}
+              {hasParticipants && (
+                <>
+                  <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-surface-700/60 border border-white/10">
+                    <Users size={11} className="text-gray-500" />
+                    <select
+                      value={turnMode}
+                      onChange={(e) => changeTurnMode(e.target.value as TurnMode)}
+                      className="bg-transparent text-xs text-gray-300 focus:outline-none cursor-pointer"
+                      title="Turn-taking mode"
+                    >
+                      {TURN_MODES.map(m => (
+                        <option key={m.value} value={m.value}>{m.label}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <button
+                    onClick={toggleAddressing}
+                    className={`btn-icon ${addressingEnabled ? 'text-primary-400 border-primary-500/30' : ''}`}
+                    title={addressingEnabled ? 'Addressing on — @/#Name lets one participant hand off to another' : 'Addressing off'}
+                    aria-pressed={addressingEnabled}
+                  >
+                    <AtSign size={13} />
+                  </button>
+                </>
+              )}
+
               {/* Language picker */}
               <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-surface-700/60 border border-white/10">
                 <Globe size={11} className="text-gray-500" />
@@ -979,10 +1073,16 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
                       ? 'bg-gradient-to-br from-accent-600 to-accent-800'
                       : 'bg-gradient-to-br from-primary-600 to-primary-800'
                     }`}
+                    title={message.participantName}
                   >
-                    {isUser ? 'U' : 'AI'}
+                    {isUser ? 'U' : (message.participantName?.[0]?.toUpperCase() ?? 'AI')}
                   </div>
                   <div className={`max-w-[85%] group ${isUser ? 'items-end' : 'items-start'} flex flex-col gap-1`}>
+                    {!isUser && message.participantName && (
+                      <span className="text-[10px] font-semibold text-primary-400 px-1">
+                        {message.participantName}
+                      </span>
+                    )}
                     {editingMessageId === message.id ? (
                       // Inline editor — Enter saves, Esc cancels, Shift+Enter newline
                       <div className="w-full flex flex-col gap-1.5">
@@ -1114,6 +1214,24 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         )}
 
         <div className="border-t border-white/8 px-4 py-3">
+          {hasParticipants && turnMode === 'human_directed' && activeParticipants.length > 0 && (
+            <div className="flex items-center gap-1.5 mb-3 px-1 flex-wrap">
+              <span className="text-xs text-gray-500">Next to speak:</span>
+              {activeParticipants.map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() => selectNextSpeaker(p.id)}
+                  className={`text-xs px-2 py-1 rounded-full border transition-colors
+                    ${nextSpeakerId === p.id
+                      ? 'bg-primary-500/20 border-primary-500 text-primary-300'
+                      : 'bg-surface-700/60 border-white/10 text-gray-400 hover:text-white hover:border-primary-500/40'
+                    }`}
+                >
+                  {p.name}
+                </button>
+              ))}
+            </div>
+          )}
           {isRecording && (
             <div className="flex items-center gap-2 mb-3 px-2">
               <span className="text-xs text-red-400 font-medium animate-pulse">REC</span>
