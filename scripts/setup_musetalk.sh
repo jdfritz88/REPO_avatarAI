@@ -66,7 +66,15 @@ cp "$PREPROCESS" "${PREPROCESS}.orig" 2>/dev/null || true
 cat > "$PREPROCESS" << 'PYEOF'
 # preprocessing.py — rewritten for Python 3.12 / CPU-only compatibility
 # Uses face_alignment (pip install face-alignment) instead of mmpose/mmcv.
+#
+# NOTE: this module is imported by the persistent musetalk_worker.py, whose
+# protocol reserves stdout exclusively for "READY" and per-job JSON replies
+# (see musetalk_worker.py's docstring). Every print() below therefore writes
+# to sys.stderr, not stdout — a stray stdout line here gets read by the
+# parent (app/services/animator.py) as if it were a job's JSON reply,
+# desyncing the protocol for the rest of the worker's lifetime.
 import os
+import sys
 import json
 import pickle
 import numpy as np
@@ -94,8 +102,8 @@ def resize_landmark(landmark, w, h, new_w, new_h):
 
 def read_imgs(img_list):
     frames = []
-    print("reading images...")
-    for img_path in tqdm(img_list):
+    print("reading images...", file=sys.stderr)
+    for img_path in tqdm(img_list, file=sys.stderr):
         frame = cv2.imread(img_path)
         frames.append(frame)
     return frames
@@ -124,8 +132,8 @@ def get_landmark_and_bbox(img_list, upperbondrange=0):
     frames = read_imgs(img_list)
     coords_list = []
     print(f"Getting face bounding boxes (bbox_shift={upperbondrange})..." if upperbondrange != 0
-          else "Getting face bounding boxes...")
-    for frame in tqdm(frames):
+          else "Getting face bounding boxes...", file=sys.stderr)
+    for frame in tqdm(frames, file=sys.stderr):
         bbox = _detect_face_bbox(frame, bbox_shift=upperbondrange)
         coords_list.append(bbox if bbox is not None else coord_placeholder)
     return coords_list, frames
@@ -134,7 +142,7 @@ def get_landmark_and_bbox(img_list, upperbondrange=0):
 def get_bbox_range(img_list, upperbondrange=0):
     frames = read_imgs(img_list)
     deltas = []
-    for frame in tqdm(frames):
+    for frame in tqdm(frames, file=sys.stderr):
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         preds = _fa.get_landmarks(frame_rgb)
         if preds is None or len(preds) == 0:
@@ -164,6 +172,38 @@ if [ -f "$WORKER_SRC" ]; then
 else
   echo "  ERROR: $WORKER_SRC not found — is the repo checkout complete?" >&2
   exit 1
+fi
+
+# ── 3c. Patch resnet.py for PyTorch 2.6's torch.load default change ────────
+# PyTorch 2.6 flipped torch.load's weights_only default to True, which can't
+# parse the ResNet18 backbone checkpoint's legacy .tar serialization format
+# (downloaded step 4 below, straight from download.pytorch.org — a trusted
+# source, so weights_only=False is safe). Without this the worker crashes on
+# startup and the animator silently falls back to no-lip-sync mode.
+echo ""
+echo "[3c/5] Patching resnet.py for PyTorch 2.6 torch.load compatibility..."
+RESNET_PY="$MUSETALK_DIR/musetalk/utils/face_parsing/resnet.py"
+if [ -f "$RESNET_PY" ] && ! grep -q "weights_only=False" "$RESNET_PY"; then
+  sed -i 's/torch\.load(model_path)/torch.load(model_path, weights_only=False)/' "$RESNET_PY"
+  echo "  resnet.py patched ✓"
+else
+  echo "  resnet.py already patched or not found — skipping"
+fi
+
+# ── 3d. Patch load_all_model()'s stray stdout print ─────────────────────────
+# musetalk_worker.py's protocol reserves stdout exclusively for "READY" and
+# per-job JSON replies (see its own docstring). utils.py's load_all_model()
+# print()s a diagnostic line to stdout during startup, which the parent
+# (app/services/animator.py) reads as the READY handshake line instead —
+# it kills the worker thinking it failed to start, every single time.
+echo ""
+echo "[3d/5] Patching load_all_model()'s stray stdout print..."
+UTILS_PY="$MUSETALK_DIR/musetalk/utils/utils.py"
+if [ -f "$UTILS_PY" ] && grep -q 'print(f"load unet model from' "$UTILS_PY"; then
+  sed -i 's/print(f"load unet model from {unet_model_path}")/import sys as _sys; _sys.stderr.write(f"load unet model from {unet_model_path}\\n")/' "$UTILS_PY"
+  echo "  utils.py patched ✓"
+else
+  echo "  utils.py already patched or not found — skipping"
 fi
 
 # ── 4. Download model weights from HuggingFace ──────────────────────────────

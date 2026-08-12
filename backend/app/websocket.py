@@ -347,6 +347,30 @@ class ConnectionManager:
         cache_path.write_bytes(data)
         return str(cache_path)
 
+    async def _resolve_participant_avatar_image(self, avatar_id: str) -> Optional[str]:
+        """
+        Resolve a participant's OWN avatar image (set via
+        ParticipantConfig.avatar_id, e.g. KINDROID_SILVA_AVATAR_ID) to a
+        local file path, reusing `_resolve_local_image`. Returns None if
+        the participant has no avatar configured or it can't be found —
+        callers fall back to the session's shared avatar in that case.
+        """
+        try:
+            from sqlalchemy import select
+
+            from app.database import AsyncSessionLocal
+            from app.models import Avatar
+
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(select(Avatar).where(Avatar.id == avatar_id))
+                avatar = result.scalar_one_or_none()
+                if not avatar:
+                    return None
+                return await self._resolve_local_image(avatar)
+        except Exception as e:
+            logger.warning(f"Could not resolve avatar image for participant avatar {avatar_id}: {e}")
+            return None
+
     async def disconnect(self, session_id: str):
         # Cancel any in-flight LLM/TTS/animation task for this session so it
         # doesn't keep churning after the client is gone (wasted tokens + GPU).
@@ -753,7 +777,17 @@ class ConnectionManager:
             await queue.put(tail)
         await queue.put(None)
 
-        await self._animate_from_queue(session_id, queue, participant=participant)
+        # Animate with THIS participant's own face when it has one
+        # configured (e.g. Silva's photo) — falls back to the session's
+        # shared avatar (_animate_from_queue's default) otherwise, so
+        # text-only participants like Mistral still produce something.
+        avatar_override = None
+        if participant.avatar_id:
+            avatar_override = await self._resolve_participant_avatar_image(participant.avatar_id)
+
+        await self._animate_from_queue(
+            session_id, queue, participant=participant, avatar_image_override=avatar_override
+        )
 
     async def _handle_text_input_inner_legacy(self, session_id: str, text: str):
         started_at = datetime.now(timezone.utc)
@@ -875,6 +909,7 @@ class ConnectionManager:
         session_id: str,
         queue: "asyncio.Queue[Optional[str]]",
         participant: Optional["ParticipantConfig"] = None,
+        avatar_image_override: Optional[str] = None,
     ) -> None:
         """
         Consume sentences from the queue and run TTS + animation for each,
@@ -882,9 +917,15 @@ class ConnectionManager:
         `participant` tags every emitted event with who's speaking (multi-
         agent turns) — None (the default) reproduces the original single-LLM
         behavior exactly, with no participant fields on the payloads.
+        `avatar_image_override` renders THIS turn with a specific
+        participant's own face instead of the session's shared avatar —
+        callers only ever hold one such call in flight at a time (the
+        round-robin loop `await`s each participant's full turn before
+        starting the next), so a listening participant's face is never
+        animated while another is speaking — no extra locking needed.
         """
         data = self.session_data.get(session_id, {})
-        avatar_image = data.get("avatar_image_local")
+        avatar_image = avatar_image_override or data.get("avatar_image_local")
         speaker_wav: Optional[str] = data.get("voice_wav")
         language: str = data.get("language", "en")
         speaker_tag: dict = (

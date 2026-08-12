@@ -1,7 +1,24 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+# No system ffmpeg is installed/on PATH on this machine (confirmed: `ffmpeg`
+# is not recognized). imageio-ffmpeg (already a dependency) bundles a real
+# ffmpeg binary — prepend its directory to PATH here, before anything else
+# spawns a subprocess, so every ffmpeg-shelling-out code path in this
+# process AND its children (e.g. the MuseTalk worker subprocess, which
+# inherits this env via os.environ.copy() in app/services/animator.py)
+# finds it without each needing its own fix.
+try:
+    import imageio_ffmpeg
+
+    _ffmpeg_dir = str(Path(imageio_ffmpeg.get_ffmpeg_exe()).parent)
+    if _ffmpeg_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+except Exception:
+    pass  # ffmpeg-dependent features degrade gracefully; not fatal at import time
 
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware

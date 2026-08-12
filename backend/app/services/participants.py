@@ -31,6 +31,10 @@ class ParticipantConfig:
     model: str = ""
     # kindroid:
     ai_id: str = ""
+    # Optional — this participant's own avatar (Avatar.id), used so its
+    # responses animate its own face instead of the session's shared one.
+    # Falls back to the session avatar when unset (e.g. text-only Mistral).
+    avatar_id: str = ""
 
 
 _KINDROID_KEY_RE = re.compile(r"^KINDROID_([A-Z0-9_]+)_API_KEY$")
@@ -59,6 +63,7 @@ def _discover_kindroid_kins() -> list[ParticipantConfig]:
                 name=slug.replace("_", " ").title(),
                 api_key=value,
                 ai_id=ai_id,
+                avatar_id=env.get(f"KINDROID_{slug}_AVATAR_ID", ""),
             )
         )
     return kins

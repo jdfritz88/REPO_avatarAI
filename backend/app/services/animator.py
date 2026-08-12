@@ -39,6 +39,11 @@ class AvatarAnimator:
         self._worker_lock = asyncio.Lock()
         self._worker_env: dict = {}
         self._worker_stderr_path: Optional[Path] = None
+        # True once THIS worker process has completed at least one real
+        # inference — the one-time CUDA/cuDNN warmup cost only needs to be
+        # paid once per process lifetime. Reset to False every time a new
+        # worker is spawned (see _ensure_worker).
+        self._worker_warmed_up = False
 
         if self.device == "cuda":
             gpu_name = torch.cuda.get_device_name(0)
@@ -75,7 +80,18 @@ class AvatarAnimator:
                 existing = os.environ.get("PYTHONPATH", "")
                 self._worker_env = os.environ.copy()
                 self._worker_env["PYTHONPATH"] = str(self._musetalk_dir) + (
-                    ":" + existing if existing else ""
+                    os.pathsep + existing if existing else ""
+                )
+                # DIAGNOSTIC (temporary — Bug #5 investigation): confirm
+                # whether main.py's ffmpeg PATH fix has actually landed in
+                # os.environ by the time this env snapshot is taken.
+                logger.info(
+                    f"[DIAG] worker env PATH (first 500 chars): "
+                    f"{self._worker_env.get('PATH', '<MISSING>')[:500]}"
+                )
+                logger.info(
+                    f"[DIAG] ffmpeg dir present in worker PATH: "
+                    f"{'imageio_ffmpeg' in self._worker_env.get('PATH', '')}"
                 )
 
         elif self.engine not in ("simple",):
@@ -129,6 +145,10 @@ class AvatarAnimator:
 
         musetalk_dir: Path = self._musetalk_dir  # type: ignore[assignment]
         worker_script = self._resolve_worker_script(musetalk_dir)
+
+        # A fresh process is always cold, regardless of whether a PRIOR
+        # worker (now dead) had warmed up.
+        self._worker_warmed_up = False
 
         logger.info("Starting persistent MuseTalk worker (loading models once)…")
         # stderr -> a file, NOT a pipe. The worker's model loading (tqdm progress,
@@ -220,8 +240,23 @@ class AvatarAnimator:
                 self._worker_proc = None
                 raise RuntimeError(f"MuseTalk worker pipe is dead: {e}") from e
 
-            # GPU: expect ~5-15s per sentence; CPU: up to 5 min
-            infer_timeout = 60 if self.device == "cuda" else 300
+            # GPU steady-state: ~5-15s per sentence — BUT the FIRST inference in
+            # a freshly-spawned worker also pays one-time CUDA context creation
+            # + cuDNN algorithm search + kernel JIT compilation. Measured
+            # exceeding even 180s on this machine (RTX 4080 Laptop) twice in a
+            # row, even though the exact same job completes in seconds once
+            # warm. A timeout here kills the process (see except below), so a
+            # too-tight timeout means the worker can never survive long enough
+            # to actually become warm — every retry re-pays the full cold-start
+            # cost and times out again, forever. Give the first call on this
+            # process a generous 300s (matching the already-proven-necessary
+            # model_load_timeout budget above); once a job has genuinely
+            # succeeded, drop to the tight 60s steady-state budget so a truly
+            # hung worker is still caught promptly.
+            if self.device == "cuda":
+                infer_timeout = 60 if self._worker_warmed_up else 300
+            else:
+                infer_timeout = 300 if self._worker_warmed_up else 600
             try:
                 result_line = await asyncio.wait_for(proc.stdout.readline(), timeout=infer_timeout)
             except asyncio.TimeoutError:
@@ -235,6 +270,8 @@ class AvatarAnimator:
                 proc.kill()
                 self._worker_proc = None
                 raise RuntimeError("MuseTalk worker exited before returning a result")
+
+            self._worker_warmed_up = True
 
             result = json.loads(result_line.decode().strip())
             if result["status"] != "ok":
