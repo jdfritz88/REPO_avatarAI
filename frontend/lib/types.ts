@@ -4,6 +4,9 @@ export interface Avatar {
   status: 'ready' | 'processing' | 'failed' | 'pending'
   thumbnail_url?: string
   image_url?: string
+  idle_video_url?: string | null
+  idle_playlist_urls?: string[] | null
+  expression_photos?: ExpressionPhoto[] | null
   s3_key?: string
   voice_id?: string | null
   avatar_metadata?: {
@@ -13,6 +16,34 @@ export interface Avatar {
     animation_style?: string
   }
   created_at?: string
+}
+
+// Raw LivePortrait ExpressionEditor node inputs — ranges match
+// backend/app/schemas.py's ExpressionParams exactly (transcribed from
+// ComfyUI-AdvancedLivePortrait/nodes.py's INPUT_TYPES, not guessed).
+export interface ExpressionParams {
+  rotate_pitch: number  // -20..20
+  rotate_yaw: number    // -20..20
+  rotate_roll: number   // -20..20
+  blink: number          // -20..5 (negative closes eyes)
+  eyebrow: number        // -10..15 (negative furrows, positive raises)
+  wink: number            // 0..25 (right-eye-only blink)
+  pupil_x: number        // -15..15
+  pupil_y: number        // -15..15
+  aaa: number              // -30..120 ("ah" mouth-open amount; 0 = closed)
+  eee: number              // -20..15 ("ee"-shape mouth pull)
+  woo: number              // -20..15 ("oo"-shape mouth pucker)
+  smile: number            // -0.3..1.3 (negative = displeasure/frown, positive = smile)
+  src_ratio: number      // 0..1 (how much of the source's own expression is kept)
+  crop_factor: number    // 1.5..2.5 (face-crop zoom factor)
+}
+
+export interface ExpressionPhoto {
+  id: string
+  label: string
+  key: string
+  url: string
+  created_at: string
 }
 
 export interface ChatMessage {

@@ -52,6 +52,21 @@ class Avatar(Base):
     image_url = Column(String, nullable=False)
     thumbnail_url = Column(String, nullable=True)
     s3_key = Column(String, nullable=False)
+    # Pre-rendered idle loop (see AvatarAnimator.generate_idle_loop) — None
+    # until first rendered, or after the photo changes and the old clip no
+    # longer matches (see PUT /avatars/{id}/photo).
+    idle_video_url = Column(String, nullable=True)
+    # Hallo2-generated idle playlist — a list of up to 6 independently
+    # loop-trimmed clip URLs (see Hallo2Animator.generate_idle_playlist).
+    # Separate from idle_video_url above: that's the older single-clip
+    # MuseTalk-based idle loop; this is the newer multi-segment, real-blink
+    # playlist meant to replace it once proven out.
+    idle_playlist_urls = Column(JSON, nullable=True)
+    # List of {id, label, url, created_at} — identity-preserving expression
+    # stills generated via LivePortrait (app/services/expression_editor.py),
+    # kept as a reusable library so the user can pick one to render as a new
+    # idle segment without regenerating it each time.
+    expression_photos = Column(JSON, nullable=True)
     status = Column(String, default="processing")  # processing, ready, failed
     voice_id = Column(
         String, nullable=True, index=True

@@ -16,7 +16,7 @@ from fastapi import WebSocket
 from app.services.animator import avatar_animator
 from app.services.llm import LLMError, build_llm_client, llm_service
 from app.services.participants import ParticipantConfig, get_participant
-from app.services.storage import storage_service
+from app.services.storage import resolve_local_image, storage_service
 from app.services.stt import stt_service
 from app.services.tts import tts_service
 from app.telemetry import span
@@ -296,6 +296,23 @@ class ConnectionManager:
                             )
                     logger.info(f"Loaded avatar {avatar.id} for session {session_id}")
 
+                    # Idle playlist is a one-time, cacheable asset (see
+                    # app/services/idle_playlist.py) — if this avatar
+                    # already has one, there's nothing to do here at all.
+                    # If not, kick generation off in the background right
+                    # as the chat room opens, same "render once, reuse
+                    # forever" idea as the rest of this feature, rather
+                    # than making the user explicitly ask for it. This is
+                    # fire-and-forget: it must NOT block the WebSocket
+                    # accept/handshake, and gpu_lock (see
+                    # app/services/gpu_lock.py) already keeps it from
+                    # stomping on this session's own live chat renders.
+                    from app.services.idle_playlist import ensure_idle_playlist, needs_idle_playlist
+
+                    if needs_idle_playlist(avatar):
+                        asyncio.create_task(ensure_idle_playlist(avatar.id))
+                        logger.info(f"Auto-triggered idle playlist generation for avatar {avatar.id}")
+
         except Exception as e:
             logger.error(f"Failed to load session data for {session_id}: {e}")
 
@@ -329,23 +346,7 @@ class ConnectionManager:
 
     async def _resolve_local_image(self, avatar) -> str:
         """Return a local FS path to the avatar image, downloading from S3 if needed."""
-        cache_path = TMPDIR / "avatars" / f"{avatar.id}.jpg"
-        if cache_path.exists():
-            return str(cache_path)
-
-        # Local storage: use get_local_path directly
-        try:
-            local = storage_service.get_local_path(avatar.s3_key)
-            if Path(local).exists():
-                return local
-        except (NotImplementedError, AttributeError):
-            pass
-
-        # S3 fallback: download and cache locally for the animator
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        data = await storage_service.download_file(avatar.s3_key)
-        cache_path.write_bytes(data)
-        return str(cache_path)
+        return await resolve_local_image(avatar.id, avatar.s3_key)
 
     async def _resolve_participant_avatar_image(self, avatar_id: str) -> Optional[str]:
         """

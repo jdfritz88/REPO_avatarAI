@@ -1,4 +1,5 @@
 import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios'
+import type { ExpressionParams } from '@/lib/types'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -135,6 +136,64 @@ export const api = {
 
   renameAvatar: async (avatarId: string, name: string) => {
     const response = await apiClient.patch(`/api/v1/avatars/${avatarId}/name`, { name })
+    return response.data
+  },
+
+  replaceAvatarPhoto: async (avatarId: string, formData: FormData) => {
+    const response = await apiClient.put(`/api/v1/avatars/${avatarId}/photo`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    return response.data
+  },
+
+  // Idle-loop render is a real MuseTalk render (60s of content, not a short
+  // chat sentence) — can take several minutes, well past the default axios
+  // timeout, so this call gets its own generous one.
+  generateIdleVideo: async (avatarId: string) => {
+    const response = await apiClient.post(`/api/v1/avatars/${avatarId}/idle-video`, null, {
+      timeout: 15 * 60 * 1000,
+    })
+    return response.data
+  },
+
+  // Expressions (LivePortrait) — identity-preserving still-photo expression
+  // edits, used to give Hallo2 idle segments more than one resting
+  // expression (Hallo2 itself has no expression input — see
+  // backend/app/services/hallo2_animator.py).
+  listExpressionPresets: async (): Promise<{ presets: string[] }> => {
+    const response = await apiClient.get('/api/v1/avatars/expression-presets')
+    return response.data
+  },
+
+  // `preset` and/or `params` (raw ExpressionEditor slider values — see
+  // ExpressionParams type) — params override the matching preset field
+  // when both given. A LivePortrait edit is a few seconds of GPU work
+  // once ComfyUI is warm, but the FIRST call also cold-starts that
+  // server — generous timeout for that case, same reasoning as
+  // generateIdleVideo below.
+  generateExpression: async (
+    avatarId: string,
+    body: { preset?: string; params?: Partial<ExpressionParams>; label?: string },
+  ) => {
+    const response = await apiClient.post(`/api/v1/avatars/${avatarId}/expressions`, body, {
+      timeout: 3 * 60 * 1000,
+    })
+    return response.data
+  },
+
+  deleteExpressionPhoto: async (avatarId: string, photoId: string) => {
+    const response = await apiClient.delete(`/api/v1/avatars/${avatarId}/expressions/${photoId}`)
+    return response.data
+  },
+
+  // A real Hallo2 render (several minutes) — same generous-timeout
+  // reasoning as generateIdleVideo/generateExpression above.
+  renderIdleSegmentFromExpression: async (avatarId: string, photoUrl: string, slotIndex?: number) => {
+    const response = await apiClient.post(
+      `/api/v1/avatars/${avatarId}/idle-playlist/from-expression`,
+      { photo_url: photoUrl, slot_index: slotIndex },
+      { timeout: 10 * 60 * 1000 },
+    )
     return response.data
   },
 

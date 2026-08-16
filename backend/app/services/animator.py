@@ -5,12 +5,15 @@ import logging
 import os
 import sys
 import tempfile
+import uuid
+import wave
 from pathlib import Path
 from typing import Optional
 
 import torch
 
 from app.config import settings
+from app.services.gpu_lock import gpu_lock
 
 TMPDIR = Path(tempfile.gettempdir())
 
@@ -39,12 +42,6 @@ class AvatarAnimator:
         self._worker_lock = asyncio.Lock()
         self._worker_env: dict = {}
         self._worker_stderr_path: Optional[Path] = None
-        # True once THIS worker process has completed at least one real
-        # inference — the one-time CUDA/cuDNN warmup cost only needs to be
-        # paid once per process lifetime. Reset to False every time a new
-        # worker is spawned (see _ensure_worker).
-        self._worker_warmed_up = False
-
         if self.device == "cuda":
             gpu_name = torch.cuda.get_device_name(0)
             vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -146,10 +143,6 @@ class AvatarAnimator:
         musetalk_dir: Path = self._musetalk_dir  # type: ignore[assignment]
         worker_script = self._resolve_worker_script(musetalk_dir)
 
-        # A fresh process is always cold, regardless of whether a PRIOR
-        # worker (now dead) had warmed up.
-        self._worker_warmed_up = False
-
         logger.info("Starting persistent MuseTalk worker (loading models once)…")
         # stderr -> a file, NOT a pipe. The worker's model loading (tqdm progress,
         # HF "Loading weights" bars, library warnings) writes a lot of stderr
@@ -187,11 +180,12 @@ class AvatarAnimator:
         proc.stdin.write(init_msg.encode())
         await proc.stdin.drain()
 
-        # Wait for READY — GPU loads much faster (~60s) vs CPU (~5-10 min first time).
-        # Bumped from 120s: cold-cache disk I/O for ~8.8GB of weights (UNet, VAE,
-        # Whisper, BiSeNet) right after a fresh worker spawn was measured timing
-        # out at 120s on this machine even on GPU.
-        model_load_timeout = 300 if self.device == "cuda" else 600
+        # Fail fast at 30s instead of hanging up to 5-10 minutes: when the GPU
+        # is contended by another process (e.g. a separate TTS server sharing
+        # this machine's single card), model loading stalls indefinitely
+        # rather than genuinely taking longer — better to give up quickly and
+        # fall back to simple animation than block the whole reply on it.
+        model_load_timeout = 30
         logger.info(f"Waiting for worker to finish loading models (timeout={model_load_timeout}s)…")
         try:
             ready_line = await asyncio.wait_for(proc.stdout.readline(), timeout=model_load_timeout)
@@ -211,7 +205,12 @@ class AvatarAnimator:
         return proc
 
     async def _worker_infer(
-        self, image_path: str, audio_path: str, output_path: str, coord_cache: Optional[str]
+        self,
+        image_path: str,
+        audio_path: str,
+        output_path: str,
+        coord_cache: Optional[str],
+        infer_timeout: int = 30,
     ) -> str:
         """Send one job to the persistent worker and await its result."""
         async with self._worker_lock:
@@ -229,49 +228,52 @@ class AvatarAnimator:
                 + "\n"
             )
 
-            # If the worker died (OOM/segfault) its stdin is closed; writing
-            # raises BrokenPipeError. Reset the handle so the NEXT job respawns
-            # a fresh worker instead of repeatedly failing against a dead pipe.
-            try:
-                proc.stdin.write(job.encode())
-                await proc.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                proc.kill()
-                self._worker_proc = None
-                raise RuntimeError(f"MuseTalk worker pipe is dead: {e}") from e
+            # gpu_lock keeps this off the GPU at the same moment as a
+            # background Hallo2 idle-playlist segment — see
+            # app/services/gpu_lock.py. Chat is the interactive path, so
+            # this acquire can make a reply wait behind an in-progress
+            # Hallo2 segment (up to that segment's remaining ~4-5 min) —
+            # accepted lag per explicit direction, not a bug. infer_timeout
+            # below only bounds the GPU call itself once the lock is held,
+            # so a long wait for the lock never gets misread as MuseTalk
+            # itself being stuck.
+            async with gpu_lock:
+                # If the worker died (OOM/segfault) its stdin is closed; writing
+                # raises BrokenPipeError. Reset the handle so the NEXT job respawns
+                # a fresh worker instead of repeatedly failing against a dead pipe.
+                try:
+                    proc.stdin.write(job.encode())
+                    await proc.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    proc.kill()
+                    self._worker_proc = None
+                    raise RuntimeError(f"MuseTalk worker pipe is dead: {e}") from e
 
-            # GPU steady-state: ~5-15s per sentence — BUT the FIRST inference in
-            # a freshly-spawned worker also pays one-time CUDA context creation
-            # + cuDNN algorithm search + kernel JIT compilation. Measured
-            # exceeding even 180s on this machine (RTX 4080 Laptop) twice in a
-            # row, even though the exact same job completes in seconds once
-            # warm. A timeout here kills the process (see except below), so a
-            # too-tight timeout means the worker can never survive long enough
-            # to actually become warm — every retry re-pays the full cold-start
-            # cost and times out again, forever. Give the first call on this
-            # process a generous 300s (matching the already-proven-necessary
-            # model_load_timeout budget above); once a job has genuinely
-            # succeeded, drop to the tight 60s steady-state budget so a truly
-            # hung worker is still caught promptly.
-            if self.device == "cuda":
-                infer_timeout = 60 if self._worker_warmed_up else 300
-            else:
-                infer_timeout = 300 if self._worker_warmed_up else 600
-            try:
-                result_line = await asyncio.wait_for(proc.stdout.readline(), timeout=infer_timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                self._worker_proc = None
-                raise RuntimeError(f"MuseTalk inference timed out after {infer_timeout}s")
+                # GPU steady-state: ~5-15s per sentence, first inference on a
+                # freshly-spawned worker pays extra one-time CUDA/cuDNN warm-up
+                # cost on top of that. Previously budgeted up to 300s/600s for
+                # this, but under GPU contention from another process (e.g. a
+                # separate TTS server sharing this machine's one card) that just
+                # means the whole reply hangs for minutes before falling back —
+                # worse than failing fast. Flat 30s default: still enough for a
+                # normal warm/cold GPU inference on a short chat sentence, but
+                # gives up quickly when the GPU is genuinely unavailable instead
+                # of blocking the user's reply. Callers rendering much longer,
+                # non-time-critical clips (e.g. a 60s idle loop) pass a bigger
+                # budget explicitly — see generate_idle_loop.
+                try:
+                    result_line = await asyncio.wait_for(proc.stdout.readline(), timeout=infer_timeout)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    self._worker_proc = None
+                    raise RuntimeError(f"MuseTalk inference timed out after {infer_timeout}s")
 
-            # Empty read == worker exited mid-job (EOF on stdout). Reset so the
-            # next call respawns instead of erroring on a half-dead process.
-            if not result_line:
-                proc.kill()
-                self._worker_proc = None
-                raise RuntimeError("MuseTalk worker exited before returning a result")
-
-            self._worker_warmed_up = True
+                # Empty read == worker exited mid-job (EOF on stdout). Reset so the
+                # next call respawns instead of erroring on a half-dead process.
+                if not result_line:
+                    proc.kill()
+                    self._worker_proc = None
+                    raise RuntimeError("MuseTalk worker exited before returning a result")
 
             result = json.loads(result_line.decode().strip())
             if result["status"] != "ok":
@@ -287,10 +289,14 @@ class AvatarAnimator:
         audio_path: str,
         output_path: str,
         cache_key: Optional[str] = None,
+        infer_timeout: int = 30,
     ) -> str:
         """
         Animate avatar with audio. Returns path to the generated video.
         Falls back to simple (static image + audio) on any engine failure.
+        `infer_timeout` bounds MuseTalk inference for THIS call — the 30s
+        default suits short live-chat sentences; longer non-time-critical
+        renders (see generate_idle_loop) pass a bigger budget.
         """
         if not self._initialised:
             await self.initialize()
@@ -300,12 +306,50 @@ class AvatarAnimator:
 
         try:
             if self.engine == "musetalk":
-                return await self._animate_musetalk(avatar_image_path, audio_path, output_path)
+                return await self._animate_musetalk(
+                    avatar_image_path, audio_path, output_path, infer_timeout=infer_timeout
+                )
             else:
                 return await self._animate_simple(avatar_image_path, audio_path, output_path)
         except Exception as e:
             logger.error(f"Animation failed ({self.engine}): {e}. Falling back to simple.")
             return await self._animate_simple(avatar_image_path, audio_path, output_path)
+
+    async def generate_idle_loop(
+        self,
+        avatar_image_path: str,
+        output_path: str,
+        duration_s: int = 60,
+    ) -> str:
+        """
+        Render a silent idle loop for an avatar: a `duration_s`-second clip
+        with no speech driving it, meant to be played on <video loop> while
+        nothing is being said (mirrors Kindroid's pre-rendered idle clip —
+        rendered once per avatar, then just looped client-side, not
+        regenerated per idle moment).
+
+        Not time-critical (nothing blocks on it — see the /idle-video
+        endpoint), so this uses a much larger inference budget than live
+        chat sentences: a 60s clip is roughly 10-20x the frame count of a
+        typical spoken sentence, so it needs proportionally longer to render
+        even on an uncontended GPU.
+        """
+        silent_wav = TMPDIR / f"idle_silence_{uuid.uuid4().hex[:12]}.wav"
+        try:
+            with wave.open(str(silent_wav), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)  # 16-bit
+                w.setframerate(24000)
+                w.writeframes(b"\x00\x00" * 24000 * duration_s)
+
+            return await self.animate(
+                avatar_image_path,
+                str(silent_wav),
+                output_path,
+                infer_timeout=max(900, duration_s * 15),
+            )
+        finally:
+            silent_wav.unlink(missing_ok=True)
 
     # ── MuseTalk ──────────────────────────────────────────────────────────────
 
@@ -314,6 +358,7 @@ class AvatarAnimator:
         avatar_path: str,
         audio_path: str,
         output_path: str,
+        infer_timeout: int = 30,
     ) -> str:
         """Run MuseTalk via persistent worker (models stay loaded between calls)."""
         musetalk_dir: Path = self._musetalk_dir  # type: ignore[assignment]
@@ -323,7 +368,9 @@ class AvatarAnimator:
         coord_cache = str(musetalk_dir / "results" / "coords" / f"{avatar_id}.pkl")
         os.makedirs(os.path.dirname(coord_cache), exist_ok=True)
 
-        await self._worker_infer(avatar_path, audio_path, output_path, coord_cache)
+        await self._worker_infer(
+            avatar_path, audio_path, output_path, coord_cache, infer_timeout=infer_timeout
+        )
 
         logger.info(f"MuseTalk animation done: {output_path}")
         return output_path

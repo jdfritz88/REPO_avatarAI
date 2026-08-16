@@ -129,7 +129,68 @@ function TypingIndicator() {
 }
 
 // Idle avatar: shows the avatar image with a breathing + glow animation
-function IdleAvatar({ imageUrl }: { imageUrl: string | null }) {
+// Fisher-Yates — a fresh random order each time the playlist is exhausted,
+// so it never plays two clips back to back twice in a row by coincidence
+// more than chance allows, and never just replays index order.
+function shuffled<T>(arr: T[]): T[] {
+  const a = [...arr]
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[a[i], a[j]] = [a[j], a[i]]
+  }
+  return a
+}
+
+/**
+ * Plays a Hallo2 idle playlist (real blinking — see hallo2_animator.py)
+ * back to back in random order, looping forever. Each clip is already
+ * individually trimmed server-side to end near the avatar's resting pose
+ * (see hallo2_worker.py's find_loop_point), and every clip also STARTS
+ * from that same pose (Hallo2 always seeds generation from the static
+ * source photo) — so any clip can follow any other without a visible cut.
+ */
+function IdlePlaylistVideo({ urls }: { urls: string[] }) {
+  const orderRef = useRef<string[]>(shuffled(urls))
+  const posRef = useRef(0)
+  // `current` alone isn't a safe React key: with 1 segment (or whenever a
+  // reshuffle happens to repeat the same URL at a cycle boundary), advance()
+  // would set the identical string again, React bails out of the state
+  // update (Object.is same-value check), the <video> never remounts, and
+  // playback sticks at `ended` forever. `plays` is a monotonic counter so
+  // every advance forces a fresh remount regardless of URL repeats.
+  const [plays, setPlays] = useState(0)
+  const current = orderRef.current[posRef.current]
+
+  const advance = () => {
+    posRef.current += 1
+    if (posRef.current >= orderRef.current.length) {
+      orderRef.current = shuffled(urls)
+      posRef.current = 0
+    }
+    setPlays((p) => p + 1)
+  }
+
+  return (
+    <video
+      key={plays}
+      src={current}
+      autoPlay
+      muted
+      playsInline
+      onEnded={advance}
+      className="relative z-10 w-full h-full object-cover"
+      style={{ borderRadius: '0.75rem' }}
+    />
+  )
+}
+
+function IdleAvatar({
+  imageUrl, videoUrl, playlistUrls,
+}: {
+  imageUrl: string | null
+  videoUrl?: string | null
+  playlistUrls?: string[] | null
+}) {
   if (!imageUrl) {
     return (
       <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
@@ -149,13 +210,29 @@ function IdleAvatar({ imageUrl }: { imageUrl: string | null }) {
         className="absolute w-[70%] aspect-square rounded-full avatar-idle-glow"
         style={{ filter: 'blur(32px)', background: 'radial-gradient(circle, rgba(124,58,237,0.15) 0%, transparent 70%)' }}
       />
-      {/* Avatar image with breathing scale */}
-      <img
-        src={imageUrl}
-        alt="Avatar idle"
-        className="avatar-idle relative z-10 w-full h-full object-cover"
-        style={{ borderRadius: '0.75rem' }}
-      />
+      {/* Priority: Hallo2 random-order playlist (real blinking) > single
+          MuseTalk idle loop (never blinks — see blink.py) > static image */}
+      {playlistUrls && playlistUrls.length > 0 ? (
+        <IdlePlaylistVideo urls={playlistUrls} />
+      ) : videoUrl ? (
+        <video
+          key={videoUrl}
+          src={videoUrl}
+          autoPlay
+          loop
+          muted
+          playsInline
+          className="relative z-10 w-full h-full object-cover"
+          style={{ borderRadius: '0.75rem' }}
+        />
+      ) : (
+        <img
+          src={imageUrl}
+          alt="Avatar idle"
+          className="avatar-idle relative z-10 w-full h-full object-cover"
+          style={{ borderRadius: '0.75rem' }}
+        />
+      )}
       {/* Subtle scanline shimmer overlay */}
       <div
         className="absolute inset-0 z-20 pointer-events-none rounded-xl"
@@ -190,6 +267,8 @@ export function ChatInterface({
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting')
   const [recordingLevel, setRecordingLevel] = useState(0)
   const [avatarImageUrl, setAvatarImageUrl] = useState<string | null>(null)
+  const [idleVideoUrl, setIdleVideoUrl] = useState<string | null>(null)
+  const [idlePlaylistUrls, setIdlePlaylistUrls] = useState<string[] | null>(null)
   // Streaming token accumulator — shown as a live bubble while LLM is generating
   const [streamingContent, setStreamingContent] = useState('')
   const [language, setLanguage] = useState('en')
@@ -241,6 +320,13 @@ export function ChatInterface({
   const chunkQueueRef = useRef<VideoChunk[]>([])
   const isPlayingRef = useRef(false)
 
+  // Replay — the most recently completed turn's chunks, kept around after
+  // they've played once so "Replay audio"/"Replay audio and video" can
+  // re-play the exact same already-rendered clips with no backend call.
+  const lastTurnChunksRef = useRef<VideoChunk[]>([])
+  const [hasReplayable, setHasReplayable] = useState(false)
+  const [replayAudioOnly, setReplayAudioOnly] = useState(false)
+
   const videoRef = useRef<HTMLVideoElement>(null)
   // Hidden video element used to preload the next chunk while the current one plays
   const preloadVideoRef = useRef<HTMLVideoElement>(null)
@@ -250,13 +336,15 @@ export function ChatInterface({
   const analyserRef = useRef<AnalyserNode | null>(null)
   const levelAnimRef = useRef<number | null>(null)
 
-  // ── Fetch avatar image on mount ──────────────────────────────────────────
+  // ── Fetch avatar image (+ idle loop, if rendered) on mount ───────────────
   useEffect(() => {
     api.getAvatars()
       .then((avatars: Avatar[]) => {
         const av = avatars.find((a: Avatar) => a.id === avatarId)
         if (av) {
           setAvatarImageUrl(av.thumbnail_url || av.image_url || null)
+          setIdleVideoUrl(av.idle_video_url || null)
+          setIdlePlaylistUrls(av.idle_playlist_urls?.length ? av.idle_playlist_urls : null)
         } else {
           toast.error('Could not load avatar image')
         }
@@ -270,6 +358,7 @@ export function ChatInterface({
     if (!next) {
       isPlayingRef.current = false
       setShowVideo(false)
+      setReplayAudioOnly(false)
       return
     }
     isPlayingRef.current = true
@@ -487,12 +576,16 @@ export function ChatInterface({
 
       case 'video_chunk_start':
         chunkQueueRef.current = []
+        lastTurnChunksRef.current = []
+        setHasReplayable(false)
         setCurrentChunkProgress({ current: 0, total: data.total_chunks })
         break
 
       case 'video_chunk': {
         const chunk: VideoChunk = { url: data.video_url, text: data.text }
         chunkQueueRef.current.push(chunk)
+        lastTurnChunksRef.current.push(chunk)
+        setHasReplayable(true)
         setCurrentChunkProgress(prev => ({ current: data.chunk_index + 1, total: prev.total }))
         // First chunk arriving → record latency, clear spinner, start playback
         if (!isPlayingRef.current) {
@@ -711,6 +804,15 @@ export function ChatInterface({
     if (videoRef.current) videoRef.current.src = ''
   }
 
+  // Re-play the most recently completed turn's already-rendered clips —
+  // no TTS/animation re-render, just re-queues the same video URLs.
+  const replayLastTurn = (audioOnly: boolean) => {
+    if (isPlayingRef.current || lastTurnChunksRef.current.length === 0) return
+    setReplayAudioOnly(audioOnly)
+    chunkQueueRef.current = [...lastTurnChunksRef.current]
+    playNextChunk()
+  }
+
   const copyMessage = (content: string) => {
     navigator.clipboard.writeText(content)
     toast.success('Copied!', { duration: 1500 })
@@ -856,16 +958,22 @@ export function ChatInterface({
             {/* ── Idle avatar (always mounted, hidden when video plays) ── */}
             <div
               className="absolute inset-0 transition-opacity duration-500"
-              style={{ opacity: showVideo ? 0 : 1, zIndex: showVideo ? 0 : 5 }}
+              style={{
+                opacity: showVideo && !replayAudioOnly ? 0 : 1,
+                zIndex: showVideo && !replayAudioOnly ? 0 : 5,
+              }}
             >
-              <IdleAvatar imageUrl={avatarImageUrl} />
+              <IdleAvatar imageUrl={avatarImageUrl} videoUrl={idleVideoUrl} playlistUrls={idlePlaylistUrls} />
             </div>
 
             {/* ── Video element (mounted always; shown only when playing) ── */}
             <video
               ref={videoRef}
               className="absolute inset-0 w-full h-full object-cover transition-opacity duration-500"
-              style={{ opacity: showVideo ? 1 : 0, zIndex: showVideo ? 5 : 0 }}
+              style={{
+                opacity: showVideo && !replayAudioOnly ? 1 : 0,
+                zIndex: showVideo && !replayAudioOnly ? 5 : 0,
+              }}
               autoPlay
               playsInline
               muted={isMuted}
@@ -992,6 +1100,36 @@ export function ChatInterface({
               </button>
             </div>
           </div>
+
+          {/* Replay bar — re-plays the last turn's already-rendered clips, no re-render */}
+          {hasReplayable && (
+            <div className="flex items-center gap-2 mt-2 px-1">
+              <button
+                onClick={() => replayLastTurn(true)}
+                disabled={showVideo}
+                className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-white
+                           disabled:opacity-40 disabled:cursor-not-allowed
+                           px-2.5 py-1.5 rounded-lg border border-white/10 hover:bg-white/5
+                           transition-colors"
+                title="Replay the last reply's audio only, no video"
+              >
+                <Volume2 size={13} />
+                Replay audio
+              </button>
+              <button
+                onClick={() => replayLastTurn(false)}
+                disabled={showVideo}
+                className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-white
+                           disabled:opacity-40 disabled:cursor-not-allowed
+                           px-2.5 py-1.5 rounded-lg border border-white/10 hover:bg-white/5
+                           transition-colors"
+                title="Replay the last reply's audio and video"
+              >
+                <Video size={13} />
+                Replay audio and video
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Emotion bar */}

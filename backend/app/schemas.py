@@ -40,6 +40,9 @@ class AvatarResponse(AvatarBase):
     user_id: str
     image_url: str
     thumbnail_url: Optional[str] = None
+    idle_video_url: Optional[str] = None
+    idle_playlist_urls: Optional[List[str]] = None
+    expression_photos: Optional[List[Dict[str, Any]]] = None
     status: str
     voice_id: Optional[str] = None
     avatar_metadata: Optional[Dict[str, Any]] = Field(None, alias="avatar_metadata")
@@ -117,6 +120,58 @@ class SessionSettingsUpdate(BaseModel):
     addressing_enabled: Optional[bool] = None
 
     model_config = {"extra": "forbid"}
+
+
+class ExpressionParams(BaseModel):
+    """
+    Raw LivePortrait ExpressionEditor node inputs — ranges transcribed
+    directly from ComfyUI-AdvancedLivePortrait/nodes.py's INPUT_TYPES (see
+    model_experiments/comfyui/expression_editor_client.py's module
+    docstring), not guessed. All optional: any field left unset falls back
+    to the chosen preset's value, then to the node's own defaults (0 for
+    everything except src_ratio=1, crop_factor=1.7).
+    """
+
+    rotate_pitch: Optional[float] = Field(default=None, ge=-20, le=20)
+    rotate_yaw: Optional[float] = Field(default=None, ge=-20, le=20)
+    rotate_roll: Optional[float] = Field(default=None, ge=-20, le=20)
+    blink: Optional[float] = Field(default=None, ge=-20, le=5)
+    eyebrow: Optional[float] = Field(default=None, ge=-10, le=15)
+    wink: Optional[float] = Field(default=None, ge=0, le=25)
+    pupil_x: Optional[float] = Field(default=None, ge=-15, le=15)
+    pupil_y: Optional[float] = Field(default=None, ge=-15, le=15)
+    aaa: Optional[float] = Field(default=None, ge=-30, le=120)
+    eee: Optional[float] = Field(default=None, ge=-20, le=15)
+    woo: Optional[float] = Field(default=None, ge=-20, le=15)
+    smile: Optional[float] = Field(default=None, ge=-0.3, le=1.3)
+    src_ratio: Optional[float] = Field(default=None, ge=0, le=1)
+    crop_factor: Optional[float] = Field(default=None, ge=1.5, le=2.5)
+
+    model_config = {"extra": "forbid"}
+
+
+class ExpressionGenerateRequest(BaseModel):
+    """
+    Generate a LivePortrait expression still. Either `preset` (one of the
+    named presets from GET /expression-presets) or `params` (raw slider
+    values from the full editor) or both — when both are given, `params`
+    values override the preset's for just those fields, everything else
+    still comes from the preset. `label` names the library entry; defaults
+    to `preset` if omitted, or "custom" for a pure-params request.
+    """
+
+    preset: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    params: Optional[ExpressionParams] = None
+    label: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+    model_config = {"extra": "forbid"}
+
+
+class IdleSegmentFromExpressionRequest(BaseModel):
+    """Render one Hallo2 idle segment from a previously-generated expression photo."""
+
+    photo_url: str
+    slot_index: Optional[int] = Field(default=None, ge=0, lt=6)
 
 
 class AvatarMetadataUpdate(BaseModel):

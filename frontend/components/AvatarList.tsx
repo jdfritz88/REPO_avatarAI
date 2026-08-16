@@ -1,8 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Trash2, Check, User, Loader2, RefreshCw, Play, Settings2, Save, X, Mic2, MicOff } from 'lucide-react'
+import { Trash2, Check, User, Loader2, RefreshCw, Play, Settings2, Save, X, Mic2, MicOff, Sparkles, ImagePlus } from 'lucide-react'
 import { toast } from 'react-hot-toast'
 import { api } from '@/lib/api'
 import Image from 'next/image'
@@ -38,6 +38,8 @@ export function AvatarList({ selectedAvatar, onSelectAvatar }: AvatarListProps) 
   const [draftPrompt, setDraftPrompt] = useState('')
   const [draftName, setDraftName] = useState('')
   const [isSaving, setIsSaving] = useState(false)
+  const photoInputRef = useRef<HTMLInputElement>(null)
+  const [replacingPhotoId, setReplacingPhotoId] = useState<string | null>(null)
 
   const { data: avatars, isLoading, refetch } = useQuery({
     queryKey: ['avatars'],
@@ -62,6 +64,43 @@ export function AvatarList({ selectedAvatar, onSelectAvatar }: AvatarListProps) 
     },
     onError: () => toast.error('Failed to unassign voice'),
   })
+
+  // Idle-loop render is a real several-minute MuseTalk job, not an instant
+  // toggle — track which avatar is mid-render so its button can show a
+  // spinner instead of looking hung.
+  const [rerollingId, setRerollingId] = useState<string | null>(null)
+  const idleVideoMutation = useMutation({
+    mutationFn: (avatarId: string) => api.generateIdleVideo(avatarId),
+    onMutate: (avatarId: string) => setRerollingId(avatarId),
+    onSuccess: () => {
+      toast.success('Idle video ready', { icon: '🎬' })
+      queryClient.invalidateQueries({ queryKey: ['avatars'] })
+    },
+    onError: () => toast.error('Failed to generate idle video'),
+    onSettled: () => setRerollingId(null),
+  })
+
+  const replacePhotoMutation = useMutation({
+    mutationFn: ({ avatarId, file }: { avatarId: string; file: File }) => {
+      const formData = new FormData()
+      formData.append('file', file)
+      return api.replaceAvatarPhoto(avatarId, formData)
+    },
+    onSuccess: () => {
+      toast.success('Photo updated — re-roll the idle video to match it')
+      queryClient.invalidateQueries({ queryKey: ['avatars'] })
+    },
+    onError: () => toast.error('Failed to replace photo'),
+    onSettled: () => setReplacingPhotoId(null),
+  })
+
+  const handlePhotoFileChosen = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''  // allow re-selecting the same file next time
+    if (file && replacingPhotoId) {
+      replacePhotoMutation.mutate({ avatarId: replacingPhotoId, file })
+    }
+  }
 
   const openEditor = (avatar: Avatar) => {
     setDraftPrompt(avatar.avatar_metadata?.system_prompt ?? '')
@@ -92,6 +131,13 @@ export function AvatarList({ selectedAvatar, onSelectAvatar }: AvatarListProps) 
 
   return (
     <div className="card flex flex-col gap-4">
+      <input
+        ref={photoInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={handlePhotoFileChosen}
+      />
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -275,6 +321,44 @@ export function AvatarList({ selectedAvatar, onSelectAvatar }: AvatarListProps) 
                                focus:border-primary-500/40 transition-all duration-200"
                     placeholder="Avatar name"
                   />
+                </div>
+
+                <div className="space-y-1.5 mb-3">
+                  <label className="text-xs font-medium text-gray-400">Photo & idle video</label>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => {
+                        setReplacingPhotoId(av.id)
+                        photoInputRef.current?.click()
+                      }}
+                      disabled={replacePhotoMutation.isPending && replacingPhotoId === av.id}
+                      className="btn-secondary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5"
+                      title="Upload a new photo for this avatar (keeps its chat history)"
+                    >
+                      {replacePhotoMutation.isPending && replacingPhotoId === av.id
+                        ? <Loader2 size={12} className="animate-spin" />
+                        : <ImagePlus size={12} />}
+                      Replace photo
+                    </button>
+                    <button
+                      onClick={() => idleVideoMutation.mutate(av.id)}
+                      disabled={rerollingId === av.id}
+                      className="btn-secondary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5"
+                      title={
+                        av.idle_video_url
+                          ? 'Re-render this avatar’s 60s idle loop (takes a few minutes)'
+                          : 'Render a 60s idle loop for this avatar (takes a few minutes)'
+                      }
+                    >
+                      {rerollingId === av.id
+                        ? <Loader2 size={12} className="animate-spin" />
+                        : <Sparkles size={12} />}
+                      {av.idle_video_url ? 'Re-roll idle video' : 'Generate idle video'}
+                    </button>
+                  </div>
+                  {rerollingId === av.id && (
+                    <p className="text-[11px] text-gray-500">Rendering — this can take a few minutes…</p>
+                  )}
                 </div>
 
                 <p className="text-xs text-gray-500 mb-2">

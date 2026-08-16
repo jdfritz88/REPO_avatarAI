@@ -190,3 +190,28 @@ def _build_storage_service():
 
 
 storage_service = _build_storage_service()
+
+
+async def resolve_local_image(avatar_id: str, s3_key: str) -> str:
+    """
+    Return a local FS path to an avatar image, downloading from S3 and
+    caching under the OS temp dir if needed. The animator (MuseTalk/ffmpeg)
+    always needs a real file path, never a served URL.
+    """
+    import tempfile
+
+    cache_path = Path(tempfile.gettempdir()) / "avatars" / f"{avatar_id}.jpg"
+    if cache_path.exists():
+        return str(cache_path)
+
+    try:
+        local = storage_service.get_local_path(s3_key)
+        if Path(local).exists():
+            return local
+    except (NotImplementedError, AttributeError):
+        pass
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    data = await storage_service.download_file(s3_key)
+    cache_path.write_bytes(data)
+    return str(cache_path)

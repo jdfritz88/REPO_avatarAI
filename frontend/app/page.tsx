@@ -32,6 +32,10 @@ const SettingsPanel = dynamic(
   () => import('@/components/SettingsPanel').then(m => m.SettingsPanel),
   { ssr: false, loading: () => <PanelLoader label="Loading settings…" /> },
 )
+const ExpressionStudio = dynamic(
+  () => import('@/components/ExpressionStudio').then(m => m.ExpressionStudio),
+  { ssr: false, loading: () => <PanelLoader label="Loading expression studio…" /> },
+)
 
 function PanelLoader({ label }: { label: string }) {
   return (
@@ -56,6 +60,7 @@ import {
   AudioWaveform,
   History,
   Settings,
+  SmilePlus,
 } from 'lucide-react'
 
 const FEATURES = [
@@ -110,7 +115,7 @@ const STATS = [
   { value: '100%', label: 'Self-hostable' },
 ]
 
-type View = 'home' | 'avatars' | 'chat' | 'voice' | 'history' | 'settings'
+type View = 'home' | 'avatars' | 'chat' | 'voice' | 'expressions' | 'history' | 'settings'
 
 export default function Home() {
   const { isAuthenticated, user, clearAuth } = useStore()
@@ -159,6 +164,7 @@ export default function Home() {
     { id: 'home', icon: Sparkles, label: 'Home' },
     { id: 'avatars', icon: Camera, label: 'Avatars' },
     { id: 'voice', icon: Mic2, label: 'Voice' },
+    { id: 'expressions', icon: SmilePlus, label: 'Expressions' },
     { id: 'chat', icon: MessageCircle, label: 'Chat', disabled: !selectedAvatar },
     { id: 'history', icon: History, label: 'History' },
     { id: 'settings', icon: Settings, label: 'Settings' },
@@ -171,7 +177,7 @@ export default function Home() {
 
       {/* ── Navigation ── */}
       <nav className="fixed top-0 left-0 right-0 z-50 h-16">
-        <div className="h-full mx-auto max-w-7xl px-6 flex items-center justify-between">
+        <div className="h-full mx-auto max-w-7xl px-6 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-primary-500 to-accent-600 flex items-center justify-center shadow-glow-sm">
               <Sparkles size={16} className="text-white" />
@@ -360,6 +366,20 @@ export default function Home() {
               <p className="text-gray-400">Clone voices and manage your voice library.</p>
             </div>
             <VoicePanel onVoiceSelect={handleVoiceSelect} />
+          </div>
+        )}
+
+        {/* ── EXPRESSIONS VIEW ── */}
+        {view === 'expressions' && (
+          <div className="max-w-6xl mx-auto px-6 py-10 animate-fade-in">
+            <div className="mb-8">
+              <h1 className="text-3xl font-black gradient-text mb-2">Expression Studio</h1>
+              <p className="text-gray-400">
+                LivePortrait can't be driven by Hallo2 (no expression input) — edit a still
+                photo's expression here, then render it into one of an avatar's 6 idle-loop slots.
+              </p>
+            </div>
+            <ExpressionStudio initialAvatarId={selectedAvatar} />
           </div>
         )}
 
