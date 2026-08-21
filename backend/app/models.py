@@ -67,6 +67,14 @@ class Avatar(Base):
     # kept as a reusable library so the user can pick one to render as a new
     # idle segment without regenerating it each time.
     expression_photos = Column(JSON, nullable=True)
+    # Which saved LlmCredential (see below) this avatar's chat sessions use
+    # by default. Null falls back to the legacy env-var participant system
+    # (app/services/participants.py) — kept for backward compatibility, not
+    # because it's the recommended path (it currently has no working
+    # default, see LlmCredential's docstring).
+    llm_credential_id = Column(
+        String, ForeignKey("llm_credentials.id", ondelete="SET NULL"), nullable=True
+    )
     status = Column(String, default="processing")  # processing, ready, failed
     voice_id = Column(
         String, nullable=True, index=True
@@ -86,6 +94,49 @@ class Avatar(Base):
         # `ORDER BY created_at DESC LIMIT N` is the list-avatars query —
         # the composite covers both predicate columns for a single index scan.
         Index("ix_avatars_user_created", "user_id", "created_at"),
+    )
+
+
+class LlmCredential(Base):
+    """
+    A user-managed AI-provider credential, entered and verified through
+    Settings > API (see frontend/components/SettingsPanel.tsx) — the
+    self-service replacement for the old "ask Claude to hand-edit a .env
+    file and restart the server" flow. Not limited to a fixed set of
+    providers: `provider` is a free label for the 4 well-known ones
+    (anthropic/mistral/openai/kindroid, which get a sane default
+    api_base_url) but the "+ Add" row in the UI can register any other
+    OpenAI-wire-compatible endpoint by supplying its own api_base_url —
+    every provider offers SOME form of API access, so nothing here assumes
+    otherwise or hardcodes a fixed provider list.
+
+    api_key is stored server-side in plain text, matching this project's
+    existing security posture for credentials (ANTHROPIC_API_KEY etc. have
+    always lived in a plaintext .env) — this is a self-hosted single-operator
+    app, not a multi-tenant SaaS. Responses that serialize this row MUST
+    mask api_key (see schemas.py's LlmCredentialResponse) rather than ever
+    return it in full after creation.
+    """
+
+    __tablename__ = "llm_credentials"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    provider = Column(String, nullable=False)  # anthropic | mistral | openai | kindroid | custom
+    label = Column(String, nullable=False)  # display name — provider default, or user-entered for custom/kindroid kins
+    api_key = Column(String, nullable=False)
+    api_base_url = Column(String, nullable=True)  # required for provider="custom"; defaulted server-side for the 4 known ones
+    kindroid_ai_id = Column(String, nullable=True)  # only meaningful when provider="kindroid"
+    is_favorite = Column(Boolean, default=False, nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    last_verified_at = Column(DateTime(timezone=True), nullable=True)
+    last_verify_ok = Column(Boolean, nullable=True)
+    last_verify_message = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_llm_credentials_user_sort", "user_id", "sort_order"),
     )
 
 

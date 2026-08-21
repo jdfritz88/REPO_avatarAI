@@ -6,7 +6,7 @@ import {
   Sparkles, Clock, Copy, RotateCcw, Wand2,
   MessageCircle, Zap, Activity, Download, Globe,
   Pencil, Trash2, Check, X, Keyboard, Plug, Square,
-  Users, AtSign,
+  Users, AtSign, Dices, Cpu,
 } from 'lucide-react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { toast } from 'react-hot-toast'
@@ -269,6 +269,8 @@ export function ChatInterface({
   const [avatarImageUrl, setAvatarImageUrl] = useState<string | null>(null)
   const [idleVideoUrl, setIdleVideoUrl] = useState<string | null>(null)
   const [idlePlaylistUrls, setIdlePlaylistUrls] = useState<string[] | null>(null)
+  const [currentLlmCredentialId, setCurrentLlmCredentialId] = useState<string | null>(null)
+  const [showLlmPicker, setShowLlmPicker] = useState(false)
   // Streaming token accumulator — shown as a live bubble while LLM is generating
   const [streamingContent, setStreamingContent] = useState('')
   const [language, setLanguage] = useState('en')
@@ -336,21 +338,55 @@ export function ChatInterface({
   const analyserRef = useRef<AnalyserNode | null>(null)
   const levelAnimRef = useRef<number | null>(null)
 
-  // ── Fetch avatar image (+ idle loop, if rendered) on mount ───────────────
-  useEffect(() => {
-    api.getAvatars()
+  // ── Fetch avatar image (+ idle loop, if rendered) ────────────────────────
+  // Pulled out of the mount effect so the re-roll button (below) can call
+  // it again afterward to pick up the freshly-rendered segments without a
+  // full remount.
+  const refreshAvatarMedia = useCallback(() => {
+    return api.getAvatars()
       .then((avatars: Avatar[]) => {
         const av = avatars.find((a: Avatar) => a.id === avatarId)
         if (av) {
           setAvatarImageUrl(av.thumbnail_url || av.image_url || null)
           setIdleVideoUrl(av.idle_video_url || null)
           setIdlePlaylistUrls(av.idle_playlist_urls?.length ? av.idle_playlist_urls : null)
+          setCurrentLlmCredentialId(av.llm_credential_id || null)
         } else {
           toast.error('Could not load avatar image')
         }
       })
       .catch(() => toast.error('Could not load avatar image'))
   }, [avatarId])
+
+  useEffect(() => {
+    refreshAvatarMedia()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [avatarId])
+
+  const rerollIdleMutation = useMutation({
+    mutationFn: () => api.rerollIdlePlaylist(avatarId),
+    onSuccess: () => {
+      toast.success('Idle animations re-rolled', { icon: '🎲' })
+      refreshAvatarMedia()
+    },
+    onError: () => toast.error('Failed to re-roll idle animations — this takes a while, check back if it timed out'),
+  })
+
+  const { data: llmCredentials } = useQuery({
+    queryKey: ['llm-credentials'],
+    queryFn: api.listLlmCredentials,
+    enabled: showLlmPicker,
+  })
+
+  const assignLlmMutation = useMutation({
+    mutationFn: (credentialId: string | null) => api.assignAvatarLlmCredential(avatarId, credentialId),
+    onSuccess: (updated: Avatar) => {
+      setCurrentLlmCredentialId(updated.llm_credential_id || null)
+      toast.success('LLM updated for this avatar', { icon: '🔀' })
+      setShowLlmPicker(false)
+    },
+    onError: () => toast.error('Failed to change LLM'),
+  })
 
   // ── Chunk queue player ───────────────────────────────────────────────────
   const playNextChunk = useCallback(() => {
@@ -630,6 +666,19 @@ export function ChatInterface({
         // gTTS — voice cloning is silently lost in that case, so warn the
         // user so they know the avatar's voice isn't what they expect.
         toast(data.message, { icon: '⚠️', duration: 5000 })
+        break
+
+      case 'watchdog_alert':
+        // MuseTalk's CUDA-graph self-check caught a real rendering glitch.
+        // 'warning' = it recovered on its own (repaired the frame, restarted
+        // its fast renderer, kept going). 'error' = it tried that once,
+        // hit the same problem again, and permanently switched to a slower
+        // but more careful renderer for the rest of this session — worth a
+        // longer, more visible toast since replies will noticeably slow down.
+        toast(data.message, {
+          icon: data.severity === 'error' ? '🐢' : '⚠️',
+          duration: data.severity === 'error' ? 8000 : 5000,
+        })
         break
 
       case 'interrupted':
@@ -952,8 +1001,13 @@ export function ChatInterface({
             <div className="absolute inset-0 rounded-2xl neon-border pointer-events-none z-10 animate-glow" />
           )}
 
-          {/* Main display area */}
-          <div className="aspect-video w-full bg-surface-950 rounded-xl overflow-hidden relative">
+          {/* Main display area — square, matching the actual avatar
+              photo/video content (512x512). This used to be aspect-video
+              (16:9), which forced object-cover to crop the extra height
+              off a square image top-and-bottom, cutting off the chin —
+              confirmed live: Avatar Studio's cards use aspect-square and
+              looked correct, only this wider container was wrong. */}
+          <div className="aspect-square w-full bg-surface-950 rounded-xl overflow-hidden relative">
 
             {/* ── Idle avatar (always mounted, hidden when video plays) ── */}
             <div
@@ -1099,6 +1153,69 @@ export function ChatInterface({
                 <Keyboard size={15} />
               </button>
             </div>
+          </div>
+
+          {/* Re-roll bar — throws away the 6 idle segments and renders fresh ones */}
+          <div className="flex items-center gap-2 mt-2 px-1">
+            <button
+              onClick={() => rerollIdleMutation.mutate()}
+              disabled={rerollIdleMutation.isPending}
+              className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-white
+                         disabled:opacity-40 disabled:cursor-not-allowed
+                         px-2.5 py-1.5 rounded-lg border border-white/10 hover:bg-white/5
+                         transition-colors"
+              title="Delete the current 6 idle animations and render 6 fresh ones (can take up to ~40 minutes)"
+            >
+              {rerollIdleMutation.isPending ? <Loader2 size={13} className="animate-spin" /> : <Dices size={13} />}
+              Re-roll idle animations
+            </button>
+
+            <div className="relative">
+              <button
+                onClick={() => setShowLlmPicker((v) => !v)}
+                className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-white
+                           px-2.5 py-1.5 rounded-lg border border-white/10 hover:bg-white/5
+                           transition-colors"
+                title="Choose which AI provider this avatar talks with"
+              >
+                <Cpu size={13} />
+                Change LLM
+              </button>
+              {showLlmPicker && (
+                <div className="absolute z-20 top-full left-0 mt-1 w-64 max-h-72 overflow-y-auto
+                                 rounded-xl bg-surface-800 border border-white/10 shadow-glow-sm p-1.5">
+                  <button
+                    onClick={() => assignLlmMutation.mutate(null)}
+                    disabled={assignLlmMutation.isPending}
+                    className={`w-full text-left px-2.5 py-1.5 rounded-lg text-xs
+                      ${!currentLlmCredentialId ? 'bg-primary-500/20 text-primary-300' : 'text-gray-400 hover:bg-white/5 hover:text-white'}`}
+                  >
+                    Default (legacy — currently broken, no key configured)
+                  </button>
+                  {!llmCredentials?.length && (
+                    <p className="text-[11px] text-gray-600 px-2.5 py-2">
+                      No saved keys yet — add one in Settings → API.
+                    </p>
+                  )}
+                  {llmCredentials?.map((cred) => (
+                    <button
+                      key={cred.id}
+                      onClick={() => assignLlmMutation.mutate(cred.id)}
+                      disabled={assignLlmMutation.isPending}
+                      className={`w-full text-left px-2.5 py-1.5 rounded-lg text-xs flex items-center justify-between gap-2
+                        ${currentLlmCredentialId === cred.id ? 'bg-primary-500/20 text-primary-300' : 'text-gray-400 hover:bg-white/5 hover:text-white'}`}
+                    >
+                      <span className="truncate">{cred.label}</span>
+                      {cred.last_verify_ok === false && <span className="text-red-400 flex-shrink-0">⚠</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {rerollIdleMutation.isPending && (
+              <span className="text-[11px] text-gray-500">Rendering fresh idle segments — this can take up to ~40 minutes…</span>
+            )}
           </div>
 
           {/* Replay bar — re-plays the last turn's already-rendered clips, no re-render */}

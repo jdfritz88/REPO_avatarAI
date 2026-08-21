@@ -13,12 +13,16 @@ here is: generate once, reuse forever, and never kick off a redundant
 concurrent generation for the same avatar.
 """
 import logging
+import tempfile
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import select
 
 from app.database import AsyncSessionLocal
 from app.models import Avatar
+from app.services.expression_editor import ExpressionEditorServiceError, expression_editor_service
 from app.services.hallo2_animator import MAX_PLAYLIST_SEGMENTS, hallo2_animator
 from app.services.storage import resolve_local_image, storage_service
 
@@ -29,10 +33,31 @@ logger = logging.getLogger(__name__)
 # auto-triggered one) both kicking off their own redundant Hallo2 batch.
 _in_progress: set[str] = set()
 
+# The 6 standard expressions the first-time auto-setup and the manual
+# re-roll both aim for — same values as ExpressionStudio's "Quick start"
+# buttons (frontend/components/ExpressionStudio.tsx) and the originally
+# requested closed/open x smile/neutral/frown set. Order here is the order
+# they land in idle_playlist_urls slots 0-5.
+STANDARD_EXPRESSION_PRESETS = [
+    "closed_smile", "closed_neutral", "closed_frown",
+    "open_smile_ee", "open_neutral_ah", "open_frown_oo",
+]
+
 
 def needs_idle_playlist(avatar: Avatar) -> bool:
     urls = avatar.idle_playlist_urls
     return not urls or len(urls) < MAX_PLAYLIST_SEGMENTS
+
+
+def needs_full_setup(avatar: Avatar) -> bool:
+    """
+    True only for a genuinely untouched avatar — no expression photos AND
+    no idle segments yet. Used to gate the auto-triggered FULL pipeline
+    (generate all 6 standard expressions, then render 6 matching idle
+    segments) on chat-session open, so it only ever fires once per avatar
+    and never overwrites anything the user already has or customized.
+    """
+    return not avatar.expression_photos and not avatar.idle_playlist_urls
 
 
 def is_generation_in_progress(avatar_id: str) -> bool:
@@ -114,3 +139,135 @@ async def ensure_idle_playlist(avatar_id: str, num_segments: int = MAX_PLAYLIST_
             return []
         finally:
             _in_progress.discard(avatar_id)
+
+
+async def ensure_expression_photos(avatar_id: str) -> list[dict]:
+    """
+    Ensure all 6 STANDARD_EXPRESSION_PRESETS exist in this avatar's
+    expression-photo library, generating whichever are missing via
+    LivePortrait. Idempotent — a preset already present (by label) is left
+    alone, not regenerated. Returns the 6 entries in
+    STANDARD_EXPRESSION_PRESETS order, or fewer if generation failed
+    partway through (same "return what succeeded" philosophy as
+    generate_idle_playlist).
+    """
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Avatar).where(Avatar.id == avatar_id))
+        avatar = result.scalar_one_or_none()
+        if not avatar:
+            return []
+
+        by_label = {p["label"]: p for p in (avatar.expression_photos or [])}
+        local_image = await resolve_local_image(avatar.id, avatar.s3_key)
+
+        for preset in STANDARD_EXPRESSION_PRESETS:
+            if preset in by_label:
+                continue
+            photo_id = str(uuid.uuid4())
+            work_path = Path(tempfile.gettempdir()) / f"{avatar_id}_expr_{photo_id}.png"
+            try:
+                await expression_editor_service.generate(local_image, str(work_path), preset=preset)
+                photo_key = f"avatars/{avatar_id}/expressions/{photo_id}.png"
+                await storage_service.upload_file(work_path.read_bytes(), photo_key, content_type="image/png")
+                entry = {
+                    "id": photo_id,
+                    "label": preset,
+                    "key": photo_key,
+                    "url": await storage_service.serving_url(photo_key),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                by_label[preset] = entry
+                avatar.expression_photos = list(avatar.expression_photos or []) + [entry]
+                await db.commit()
+                await db.refresh(avatar)
+                logger.info(f"Generated standard expression '{preset}' for avatar {avatar_id}")
+            except ExpressionEditorServiceError as e:
+                logger.error(f"Failed to generate standard expression '{preset}' for avatar {avatar_id}: {e}")
+                break
+            finally:
+                work_path.unlink(missing_ok=True)
+
+        return [by_label[p] for p in STANDARD_EXPRESSION_PRESETS if p in by_label]
+
+
+async def generate_full_idle_set(avatar_id: str) -> list[str]:
+    """
+    Full pipeline: ensure the 6 standard expression photos exist (see
+    ensure_expression_photos), then render EACH into a fresh Hallo2 idle
+    segment, replacing idle_playlist_urls entirely (unlike
+    ensure_idle_playlist, which only tops up gaps — this always re-renders
+    all 6, since the point of a "re-roll" is fresh motion/blink timing
+    even against unchanged source photos).
+
+    Used for both: (1) the one-time auto-trigger on an avatar's very
+    first chat session (see needs_full_setup + app/websocket.py), and (2)
+    the manual re-roll button in the Chat view. Same in-flight guard as
+    ensure_idle_playlist — returns [] if another call is already running
+    for this avatar.
+    """
+    if avatar_id in _in_progress:
+        logger.info(f"Idle set generation already in progress for avatar {avatar_id}, skipping")
+        return []
+
+    _in_progress.add(avatar_id)
+    try:
+        photos = await ensure_expression_photos(avatar_id)
+        if not photos:
+            logger.error(f"No expression photos available to build an idle set for avatar {avatar_id}")
+            return []
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Avatar).where(Avatar.id == avatar_id))
+            avatar_row = result.scalar_one_or_none()
+            if not avatar_row:
+                return []
+            # Every segment below is driven by a DIFFERENT expression photo,
+            # but they all need to fade to/from the SAME bookend frame for
+            # a seamless cut between any two of them — the avatar's one
+            # original photo, not each segment's own (different) source.
+            # See hallo2_worker.py's add_bookend_fades for the actual
+            # compositing.
+            bookend_local_path = await resolve_local_image(avatar_row.id, avatar_row.s3_key)
+
+        work_dir = Path(tempfile.gettempdir()) / f"{avatar_id}_idle_reroll"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        new_urls: list[str] = []
+
+        try:
+            for idx, photo in enumerate(photos):
+                source_path = work_dir / f"source_{idx}.png"
+                source_path.write_bytes(await storage_service.download_file(photo["key"]))
+                output_path = work_dir / f"segment_{idx}.mp4"
+                try:
+                    local_result = await hallo2_animator.generate_one_idle_segment(
+                        str(source_path), str(output_path), seed=2042 + idx,
+                        bookend_image_path=bookend_local_path,
+                    )
+                except Exception as e:
+                    logger.error(f"Idle re-roll segment {idx} ('{photo['label']}') failed for avatar {avatar_id}: {e}")
+                    break
+
+                video_key = f"avatars/{avatar_id}/idle_playlist/segment_{idx}.mp4"
+                await storage_service.upload_file(
+                    Path(local_result).read_bytes(), video_key, content_type="video/mp4"
+                )
+                new_urls.append(await storage_service.serving_url(video_key))
+                logger.info(f"Idle re-roll segment {idx + 1}/{len(photos)} ('{photo['label']}') done for avatar {avatar_id}")
+        finally:
+            import shutil
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+        if not new_urls:
+            return []
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Avatar).where(Avatar.id == avatar_id))
+            avatar = result.scalar_one_or_none()
+            if avatar:
+                avatar.idle_playlist_urls = new_urls
+                await db.commit()
+
+        logger.info(f"Idle set re-rolled for avatar {avatar_id}: {len(new_urls)} segments")
+        return new_urls
+    finally:
+        _in_progress.discard(avatar_id)

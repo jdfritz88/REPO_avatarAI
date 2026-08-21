@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 from fastapi import WebSocket
 
+from app.config import settings
 from app.services.animator import avatar_animator
 from app.services.llm import LLMError, build_llm_client, llm_service
 from app.services.participants import ParticipantConfig, get_participant
@@ -299,19 +300,37 @@ class ConnectionManager:
                     # Idle playlist is a one-time, cacheable asset (see
                     # app/services/idle_playlist.py) — if this avatar
                     # already has one, there's nothing to do here at all.
-                    # If not, kick generation off in the background right
-                    # as the chat room opens, same "render once, reuse
-                    # forever" idea as the rest of this feature, rather
-                    # than making the user explicitly ask for it. This is
-                    # fire-and-forget: it must NOT block the WebSocket
-                    # accept/handshake, and gpu_lock (see
-                    # app/services/gpu_lock.py) already keeps it from
-                    # stomping on this session's own live chat renders.
-                    from app.services.idle_playlist import ensure_idle_playlist, needs_idle_playlist
+                    # If not, add it to the render queue (see
+                    # app/services/render_queue.py) right as the chat room
+                    # opens, same "render once, reuse forever" idea as the
+                    # rest of this feature, rather than making the user
+                    # explicitly ask for it. Queuing (not directly awaiting
+                    # or bare-create_task-ing) is what makes this
+                    # cancellable — deleting an avatar before its queued
+                    # job starts now actually removes the pending work
+                    # instead of letting it run against a deleted avatar.
+                    #
+                    # A genuinely untouched avatar (no expression photos,
+                    # no idle segments — needs_full_setup) gets the FULL
+                    # pipeline instead of the plain top-up: generate all 6
+                    # standard expression stills via LivePortrait, then
+                    # render each into its own idle segment, so the very
+                    # first playlist an avatar ever gets already has real
+                    # expression variety rather than the same photo x6.
+                    # This only ever fires once per avatar — any avatar
+                    # that already has SOME state (photos or segments,
+                    # including from a prior top-up) falls back to the
+                    # lighter top-up job so it never overwrites something
+                    # the user already made or customized.
+                    from app.services.idle_playlist import needs_full_setup, needs_idle_playlist
+                    from app.services.render_queue import render_queue
 
-                    if needs_idle_playlist(avatar):
-                        asyncio.create_task(ensure_idle_playlist(avatar.id))
-                        logger.info(f"Auto-triggered idle playlist generation for avatar {avatar.id}")
+                    if needs_full_setup(avatar):
+                        render_queue.enqueue(avatar.id, avatar.name, "full_setup")
+                        logger.info(f"Queued FULL idle set generation for avatar {avatar.id}")
+                    elif needs_idle_playlist(avatar):
+                        render_queue.enqueue(avatar.id, avatar.name, "topup")
+                        logger.info(f"Queued idle playlist top-up for avatar {avatar.id}")
 
         except Exception as e:
             logger.error(f"Failed to load session data for {session_id}: {e}")
@@ -847,6 +866,88 @@ class ConnectionManager:
 
     # ── streaming pipeline ────────────────────────────────────────────────────
 
+    async def _resolve_avatar_llm_stream(self, avatar_id: Optional[str], messages: List[dict], system_prompt: Optional[str]):
+        """
+        If this avatar has a saved LlmCredential assigned (Settings > API —
+        see app/services/llm_credentials.py, app/models.py's LlmCredential),
+        stream its response through THAT credential instead of the legacy
+        global `llm_service`, which only ever reads ANTHROPIC_API_KEY from
+        env — confirmed unset via a real failed chat ("Could not resolve
+        authentication method"), so any avatar without an assigned
+        credential still silently fails exactly as before. Returns None if
+        no credential is assigned, so the caller falls back unchanged.
+
+        Kindroid has no streaming API (a single blocking POST — see
+        app/services/kindroid.py's docstring), so a Kindroid-assigned
+        avatar's whole reply is yielded as one chunk here rather than
+        token-by-token — the frontend's "live typing" effect degrades to
+        "appears all at once" for those avatars specifically, an accepted
+        trade-off already true of Kindroid kins in the existing multi-agent
+        path (KindroidClient.turn() also returns a complete string, not a
+        generator).
+        """
+        if not avatar_id:
+            return None
+
+        from sqlalchemy import select as _select
+
+        from app.database import AsyncSessionLocal
+        from app.models import Avatar as _Avatar
+        from app.models import LlmCredential as _LlmCredential
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(_select(_Avatar).where(_Avatar.id == avatar_id))
+            avatar = result.scalar_one_or_none()
+            if not avatar or not avatar.llm_credential_id:
+                return None
+            cred_result = await db.execute(
+                _select(_LlmCredential).where(_LlmCredential.id == avatar.llm_credential_id)
+            )
+            cred = cred_result.scalar_one_or_none()
+            if not cred:
+                return None
+
+        _DEFAULT_MODELS = {"openai": "gpt-4o", "mistral": "mistral-large-latest"}
+        ptype = "anthropic" if cred.provider == "anthropic" else ("kindroid" if cred.provider == "kindroid" else "openai_compat")
+        participant = ParticipantConfig(
+            id=f"avatar-cred-{cred.id}",
+            type=ptype,
+            name=cred.label,
+            api_key=cred.api_key,
+            base_url=cred.api_base_url,
+            model=settings.LLM_MODEL if cred.provider == "anthropic" else _DEFAULT_MODELS.get(cred.provider, settings.LLM_MODEL),
+            ai_id=cred.kindroid_ai_id or "",
+        )
+        client = build_llm_client(participant)
+
+        from app.services.kindroid import KindroidClient
+
+        if isinstance(client, KindroidClient):
+            async def _paced_stream():
+                """
+                Kindroid's `/send-message` has no streaming mode — it returns the
+                full reply in one HTTP response. Yielding that whole string as a
+                single "token" makes `_llm_producer` dump the complete text into
+                the frontend transcript and drain every speakable chunk into the
+                TTS/animation queue in one tight loop, all within milliseconds.
+                The result (confirmed via live testing): the chat bubble shows
+                the full reply instantly while the avatar is still working
+                through rendering/playing it, several seconds to tens of seconds
+                behind. Releasing the text word-by-word on a short delay makes
+                token pacing (and therefore chunk-queueing) resemble a real
+                streaming provider, keeping visible text roughly in step with
+                what the avatar has actually gotten to.
+                """
+                text = await client.respond(messages[-1]["content"] if messages else "")
+                words = text.split(" ")
+                for i, word in enumerate(words):
+                    piece = word if i == 0 else " " + word
+                    yield piece
+                    await asyncio.sleep(0.09)
+            return _paced_stream()
+
+        return client.stream_response(messages, system_prompt)
+
     async def _llm_producer(
         self,
         session_id: str,
@@ -867,9 +968,13 @@ class ConnectionManager:
         full_text = ""
         first_chunk_sent = False
 
+        avatar_id = self.session_data.get(session_id, {}).get("avatar_id")
+        avatar_stream = await self._resolve_avatar_llm_stream(avatar_id, messages, system_prompt)
+        stream = avatar_stream if avatar_stream is not None else llm_service.stream_response(messages, system_prompt)
+
         try:
             with span("llm.stream", **{"history_len": len(messages)}):
-                async for token in llm_service.stream_response(messages, system_prompt):
+                async for token in stream:
                     if session_id not in self.active_connections:
                         break  # client disconnected
 
@@ -1016,6 +1121,25 @@ class ConnectionManager:
                         avatar_image_path=avatar_image,
                         audio_path=str(tmp_audio),
                         output_path=str(tmp_video),
+                    )
+
+                # Surface a real, visible alert if MuseTalk's CUDA-graph
+                # watchdog caught and repaired a rendering glitch (or, after
+                # a second cluster, permanently fell back to slower
+                # rendering) — this is set on the shared animator singleton
+                # by _worker_infer and must be consumed here (checked once
+                # per chunk, cleared immediately) so it isn't re-sent on
+                # every subsequent chunk.
+                if avatar_animator.pending_watchdog_alert is not None:
+                    alert = avatar_animator.pending_watchdog_alert
+                    avatar_animator.pending_watchdog_alert = None
+                    await self.send_message(
+                        session_id,
+                        {
+                            "type": "watchdog_alert",
+                            "severity": alert.get("severity", "warning"),
+                            "message": alert.get("message", "The animation renderer recovered from an internal glitch."),
+                        },
                     )
 
                 ts = int(datetime.now(timezone.utc).timestamp() * 1000)

@@ -43,6 +43,7 @@ class AvatarResponse(AvatarBase):
     idle_video_url: Optional[str] = None
     idle_playlist_urls: Optional[List[str]] = None
     expression_photos: Optional[List[Dict[str, Any]]] = None
+    llm_credential_id: Optional[str] = None
     status: str
     voice_id: Optional[str] = None
     avatar_metadata: Optional[Dict[str, Any]] = Field(None, alias="avatar_metadata")
@@ -186,6 +187,58 @@ class AvatarMetadataUpdate(BaseModel):
     personality: Optional[str] = Field(default=None, max_length=2000)
     background_color: Optional[str] = Field(default=None, max_length=32)
     animation_style: Optional[str] = Field(default=None, max_length=32)
+
+    model_config = {"extra": "forbid"}
+
+
+# LLM Credential Schemas
+class LlmCredentialCreate(BaseModel):
+    provider: str = Field(..., min_length=1, max_length=32)
+    label: str = Field(..., min_length=1, max_length=64)
+    api_key: str = Field(..., min_length=1, max_length=500)
+    # Required for provider="custom" (no known default); optional override
+    # for the 4 known providers, which get a sane default server-side.
+    api_base_url: Optional[str] = Field(default=None, max_length=500)
+    kindroid_ai_id: Optional[str] = Field(default=None, max_length=200)
+
+    model_config = {"extra": "forbid"}
+
+
+class LlmCredentialUpdate(BaseModel):
+    label: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    api_key: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    api_base_url: Optional[str] = Field(default=None, max_length=500)
+    kindroid_ai_id: Optional[str] = Field(default=None, max_length=200)
+    is_favorite: Optional[bool] = None
+
+    model_config = {"extra": "forbid"}
+
+
+class LlmCredentialReorder(BaseModel):
+    ordered_ids: List[str]
+
+    model_config = {"extra": "forbid"}
+
+
+class LlmCredentialResponse(BaseModel):
+    id: str
+    provider: str
+    label: str
+    api_key_masked: str
+    api_base_url: Optional[str] = None
+    kindroid_ai_id: Optional[str] = None
+    is_favorite: bool
+    sort_order: int
+    last_verified_at: Optional[datetime] = None
+    last_verify_ok: Optional[bool] = None
+    last_verify_message: Optional[str] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AvatarLlmAssign(BaseModel):
+    llm_credential_id: Optional[str] = None  # null clears the assignment (falls back to legacy default)
 
     model_config = {"extra": "forbid"}
 

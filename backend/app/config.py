@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     SECRET_KEY: str
 
+    # Experiment: force Chatterbox TTS onto CPU instead of GPU, so its
+    # process never holds a CUDA context alongside the MuseTalk worker's.
+    # Default False — this only changes behavior when explicitly set.
+    FORCE_TTS_CPU: bool = False
+
     # Database
     DATABASE_URL: str = "postgresql://avatar_user:password@localhost:5432/avatar_db"
     DATABASE_HOST: str = "localhost"

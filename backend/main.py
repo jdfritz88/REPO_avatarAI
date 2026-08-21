@@ -29,7 +29,7 @@ from jose import JWTError, jwt
 from prometheus_fastapi_instrumentator import Instrumentator
 from sqlalchemy import select, text
 
-from app.api.v1 import avatars, conversations, llm, messages, sessions, users, voices
+from app.api.v1 import avatars, conversations, llm, llm_credentials, messages, sessions, users, voices
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine
 from app.logging_config import configure_logging
@@ -125,6 +125,10 @@ async def lifespan(app: FastAPI):
         logger.info(f"Serving local uploads from {uploads_dir}")
 
     websocket_manager.start_cleanup_task()
+
+    from app.services.render_queue import render_queue
+    render_queue.start()
+
     logger.info("AI Avatar System started successfully")
 
     yield
@@ -174,6 +178,7 @@ app.include_router(conversations.router, prefix="/api/v1/conversations", tags=["
 app.include_router(messages.router, prefix="/api/v1/messages", tags=["messages"])
 app.include_router(voices.router, prefix="/api/v1/voices", tags=["voices"])
 app.include_router(llm.router, prefix="/api/v1/llm", tags=["llm"])
+app.include_router(llm_credentials.router, prefix="/api/v1/llm-credentials", tags=["llm-credentials"])
 
 
 @app.exception_handler(Exception)

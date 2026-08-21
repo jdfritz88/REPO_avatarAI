@@ -31,6 +31,8 @@ works: every segment starts from the same static source photo).
 import asyncio
 import json
 import logging
+import os
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -42,9 +44,37 @@ import numpy as np
 
 from app.config import settings
 from app.services.gpu_lock import gpu_lock
+from app.services import win_process_tree as _win_job
 
 TMPDIR = Path(tempfile.gettempdir())
 logger = logging.getLogger(__name__)
+
+
+def _kill_worker_tree(proc: "asyncio.subprocess.Process", job: Optional[int] = None) -> None:
+    """
+    Kill a worker subprocess AND its descendants — see the identical
+    helper (and full explanation) in app/services/animator.py. Same root
+    cause applies here: the Hallo2 venv's python.exe re-execs the real
+    interpreter as a child, so `proc.kill()` alone leaks it, and plain
+    `taskkill /T` has a confirmed real gap if the stub has already exited
+    by kill time (measured directly: it returns "process not found" and
+    never reaches the grandchild). `job` — a Windows Job Object the worker
+    was assigned to immediately at spawn time — is the primary, reliable
+    mechanism now; taskkill is kept as a harmless secondary attempt.
+    """
+    if os.name != "nt":
+        if proc.pid is not None:
+            proc.kill()
+        return
+
+    if job:
+        _win_job.kill_job(job, "hallo2_worker")
+
+    if proc.pid is not None:
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+        )
 
 # Everything lives under backend/model_experiments/hallo2/ tonight — this
 # mirrors how MuseTalk's path is configurable via settings, but Hallo2 was
@@ -75,6 +105,7 @@ class Hallo2Animator:
 
     def __init__(self):
         self._worker_proc: Optional[asyncio.subprocess.Process] = None
+        self._worker_job: Optional[int] = None  # Windows Job Object handle — see win_process_tree.py
         self._worker_lock = asyncio.Lock()
         self._stderr_path = _HALLO2_DIR / "worker_stderr.log"
         self._available = _HALLO2_VENV_PYTHON.exists() and _HALLO2_WORKER_SCRIPT.exists()
@@ -109,6 +140,15 @@ class Hallo2Animator:
         )
         stderr_file.close()
 
+        # See animator.py's identical block for why this ordering (assign
+        # to job immediately after spawn, before anything else) matters —
+        # measured directly against the real MuseTalk worker script to
+        # confirm the margin is real, not assumed; same launcher-stub
+        # pattern applies to this venv's python.exe too.
+        self._worker_job = _win_job.create_kill_on_close_job("hallo2_worker")
+        if self._worker_job:
+            _win_job.assign_pid_to_job(self._worker_job, proc.pid, "hallo2_worker")
+
         init_msg = json.dumps({"config": _HALLO2_CONFIG}) + "\n"
         proc.stdin.write(init_msg.encode())
         await proc.stdin.drain()
@@ -116,11 +156,13 @@ class Hallo2Animator:
         try:
             ready_line = await asyncio.wait_for(proc.stdout.readline(), timeout=_MODEL_LOAD_TIMEOUT_S)
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_worker_tree(proc, self._worker_job)
+            self._worker_job = None
             raise Hallo2AnimatorError(f"Hallo2 worker timed out loading models after {_MODEL_LOAD_TIMEOUT_S}s")
 
         if not ready_line.decode().strip().startswith("READY"):
-            proc.kill()
+            _kill_worker_tree(proc, self._worker_job)
+            self._worker_job = None
             tail = self._stderr_path.read_text(errors="replace")[-4000:] if self._stderr_path.exists() else ""
             raise Hallo2AnimatorError(f"Hallo2 worker failed to start. stderr (tail):\n{tail}")
 
@@ -128,7 +170,10 @@ class Hallo2Animator:
         self._worker_proc = proc
         return proc
 
-    async def _run_job(self, source_image: str, driving_audio: str, output_path: str, seed: int) -> str:
+    async def _run_job(
+        self, source_image: str, driving_audio: str, output_path: str, seed: int,
+        bookend_image: Optional[str] = None,
+    ) -> str:
         async with self._worker_lock:
             proc = await self._ensure_worker()
 
@@ -137,6 +182,7 @@ class Hallo2Animator:
                 "driving_audio": driving_audio,
                 "output": output_path,
                 "seed": seed,
+                "bookend_image": bookend_image,
             }) + "\n"
 
             # gpu_lock (not just _worker_lock above) is what actually keeps
@@ -151,20 +197,23 @@ class Hallo2Animator:
                     proc.stdin.write(job.encode())
                     await proc.stdin.drain()
                 except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                    proc.kill()
+                    _kill_worker_tree(proc, self._worker_job)
                     self._worker_proc = None
+                    self._worker_job = None
                     raise Hallo2AnimatorError(f"Hallo2 worker pipe is dead: {e}") from e
 
                 try:
                     result_line = await asyncio.wait_for(proc.stdout.readline(), timeout=_JOB_TIMEOUT_S)
                 except asyncio.TimeoutError:
-                    proc.kill()
+                    _kill_worker_tree(proc, self._worker_job)
                     self._worker_proc = None
+                    self._worker_job = None
                     raise Hallo2AnimatorError(f"Hallo2 render timed out after {_JOB_TIMEOUT_S}s")
 
                 if not result_line:
-                    proc.kill()
+                    _kill_worker_tree(proc, self._worker_job)
                     self._worker_proc = None
+                    self._worker_job = None
                     raise Hallo2AnimatorError("Hallo2 worker exited before returning a result")
 
             result = json.loads(result_line.decode().strip())
@@ -225,7 +274,10 @@ class Hallo2Animator:
             w.setframerate(sample_rate)
             w.writeframes(samples.tobytes())
 
-    async def generate_one_idle_segment(self, source_image_path: str, output_path: str, seed: int = 42) -> str:
+    async def generate_one_idle_segment(
+        self, source_image_path: str, output_path: str, seed: int = 42,
+        bookend_image_path: Optional[str] = None,
+    ) -> str:
         """
         Render a single idle segment from an arbitrary source image — e.g.
         a LivePortrait expression-edited still (see
@@ -234,11 +286,24 @@ class Hallo2Animator:
         generate_idle_playlist, just for one on-demand render instead of a
         batch, for the "pick an expression, render it as a new idle
         segment" UI flow.
+
+        `bookend_image_path` forces the clip's true first/last frame to a
+        SHARED static image (the avatar's original photo) rather than
+        whichever expression photo drove the animation — see
+        hallo2_worker.py's add_bookend_fades for why this matters: without
+        it, different segments driven by different expression photos have
+        no common frame to loop-cut between, so any two segments played
+        back-to-back show a visible jump instead of a seamless cut.
+        Defaults to source_image_path (old single-photo behavior) when
+        omitted.
         """
         silent_wav = TMPDIR / f"hallo2_idle_silence_{uuid.uuid4().hex[:12]}.wav"
         try:
             self._generate_near_silent_wav(silent_wav, seed=1000 + seed)
-            return await self._run_job(source_image_path, str(silent_wav), output_path, seed)
+            return await self._run_job(
+                source_image_path, str(silent_wav), output_path, seed,
+                bookend_image=bookend_image_path,
+            )
         finally:
             for attempt in range(5):
                 try:

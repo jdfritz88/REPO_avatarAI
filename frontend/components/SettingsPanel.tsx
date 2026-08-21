@@ -1,13 +1,17 @@
 'use client'
 
 import { useState } from 'react'
-import { Save, Loader2, User, KeyRound, Trash2 } from 'lucide-react'
+import { Save, Loader2, User, KeyRound, Trash2, KeySquare } from 'lucide-react'
 import { toast } from 'react-hot-toast'
 import { api } from '@/lib/api'
 import { useStore } from '@/store/useStore'
+import { ApiCredentialsPanel } from '@/components/ApiCredentialsPanel'
 import type { ApiError } from '@/lib/types'
 
+type SettingsTab = 'profile' | 'api'
+
 export function SettingsPanel() {
+  const [tab, setTab] = useState<SettingsTab>('profile')
   const { user, setAuth, token, clearAuth } = useStore()
   const [fullName, setFullName] = useState(user?.full_name || '')
   const [username, setUsername] = useState(user?.username || '')
@@ -76,6 +80,27 @@ export function SettingsPanel() {
         <h1 className="text-3xl font-black gradient-text mb-2">Settings</h1>
         <p className="text-gray-400">Manage your account and preferences.</p>
       </div>
+
+      <div className="flex items-center gap-1 p-1 mb-6 rounded-xl bg-surface-800/80 border border-white/8 w-fit">
+        <button
+          onClick={() => setTab('profile')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all
+            ${tab === 'profile' ? 'bg-gradient-to-r from-primary-600/80 to-accent-600/80 text-white' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+        >
+          <User size={14} /> Profile
+        </button>
+        <button
+          onClick={() => setTab('api')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all
+            ${tab === 'api' ? 'bg-gradient-to-r from-primary-600/80 to-accent-600/80 text-white' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+        >
+          <KeySquare size={14} /> API
+        </button>
+      </div>
+
+      {tab === 'api' && <ApiCredentialsPanel />}
+
+      {tab === 'profile' && (<>
 
       {isGuest && (
         <div className="card-glow mb-6 flex items-start gap-3">
@@ -203,6 +228,8 @@ export function SettingsPanel() {
           Sign out
         </button>
       </div>
+
+      </>)}
     </div>
   )
 }

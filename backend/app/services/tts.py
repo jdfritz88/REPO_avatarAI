@@ -115,7 +115,11 @@ class TTSService:
             try:
                 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
-                device = "cuda" if self._check_cuda() else "cpu"
+                if settings.FORCE_TTS_CPU:
+                    device = "cpu"
+                    logger.warning("FORCE_TTS_CPU=1 — Chatterbox will run on CPU, not GPU")
+                else:
+                    device = "cuda" if self._check_cuda() else "cpu"
                 logger.info(f"Loading Chatterbox multilingual TTS on {device}...")
                 self.model = await asyncio.to_thread(
                     ChatterboxMultilingualTTS.from_pretrained, device=device

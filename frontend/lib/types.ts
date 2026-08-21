@@ -7,6 +7,7 @@ export interface Avatar {
   idle_video_url?: string | null
   idle_playlist_urls?: string[] | null
   expression_photos?: ExpressionPhoto[] | null
+  llm_credential_id?: string | null
   s3_key?: string
   voice_id?: string | null
   avatar_metadata?: {
@@ -36,6 +37,23 @@ export interface ExpressionParams {
   smile: number            // -0.3..1.3 (negative = displeasure/frown, positive = smile)
   src_ratio: number      // 0..1 (how much of the source's own expression is kept)
   crop_factor: number    // 1.5..2.5 (face-crop zoom factor)
+}
+
+export type LlmProvider = 'anthropic' | 'mistral' | 'openai' | 'kindroid' | 'custom'
+
+export interface LlmCredential {
+  id: string
+  provider: LlmProvider | string
+  label: string
+  api_key_masked: string
+  api_base_url?: string | null
+  kindroid_ai_id?: string | null
+  is_favorite: boolean
+  sort_order: number
+  last_verified_at?: string | null
+  last_verify_ok?: boolean | null
+  last_verify_message?: string | null
+  created_at: string
 }
 
 export interface ExpressionPhoto {
@@ -77,6 +95,7 @@ export type WsMessageType =
   | 'pong'
   | 'tts_fallback'
   | 'interrupted'
+  | 'watchdog_alert'
 
 // Speaker attribution — present only on events from a multi-agent turn
 // (Session has active `participants` configured); absent/undefined on the
@@ -107,6 +126,7 @@ export type WsMessage =
   | { type: 'pong' }
   | { type: 'tts_fallback'; engine: string; voice_cloned: boolean; message: string }
   | { type: 'interrupted'; message: string }
+  | { type: 'watchdog_alert'; severity: 'warning' | 'error'; message: string }
 
 // A selectable multi-agent participant (GET /api/v1/llm/participants).
 export interface Participant {

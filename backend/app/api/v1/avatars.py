@@ -12,8 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.users import get_current_user
 from app.database import get_db
-from app.models import Avatar, User
+from app.models import Avatar, LlmCredential, User
 from app.schemas import (
+    AvatarLlmAssign,
     AvatarMetadataUpdate,
     AvatarRename,
     AvatarResponse,
@@ -25,6 +26,7 @@ from app.services.animator import avatar_animator
 from app.services.expression_editor import ExpressionEditorServiceError, expression_editor_service
 from app.services.hallo2_animator import MAX_PLAYLIST_SEGMENTS, hallo2_animator
 from app.services.idle_playlist import ensure_idle_playlist, is_generation_in_progress
+from app.services.render_queue import render_queue
 from app.services.avatar_processor import avatar_processor
 from app.services.storage import resolve_local_image, storage_service
 
@@ -156,6 +158,39 @@ async def list_avatars(
         .order_by(Avatar.created_at.desc())
     )
     return result.scalars().all()
+
+
+@router.get("/render-queue")
+async def list_render_queue(current_user: Optional[User] = Depends(get_current_user)):
+    """
+    Current state of the shared expression/idle-segment render queue (see
+    app/services/render_queue.py) — one running job at a time plus
+    whatever's queued behind it, across ALL avatars. Lets the UI show
+    "your avatar's setup is #2 in line" instead of a bare spinner, and
+    surface a cancel button for anything still queued.
+
+    Registered before /{avatar_id} below for the same reason as
+    /expression-presets — FastAPI matches routes in declaration order.
+    """
+    return {"jobs": render_queue.snapshot()}
+
+
+@router.delete("/render-queue/{job_id}")
+async def cancel_render_queue_job(job_id: str, current_user: Optional[User] = Depends(get_current_user)):
+    """
+    Cancel a QUEUED (not yet started) job. Never interrupts one that's
+    already running — cancel_by_avatar/cancel() only ever remove work
+    that hasn't started, by design (see render_queue.py's module
+    docstring for why: cancelling should never touch whatever's actually
+    mid-render).
+    """
+    cancelled = render_queue.cancel(job_id)
+    if not cancelled:
+        raise HTTPException(
+            status_code=409,
+            detail="Job is already running/finished (or doesn't exist) — only queued jobs can be cancelled",
+        )
+    return {"cancelled": True}
 
 
 @router.get("/expression-presets")
@@ -398,6 +433,50 @@ async def generate_idle_playlist(
     return avatar
 
 
+@router.post("/{avatar_id}/idle-playlist/reroll", response_model=AvatarResponse)
+async def reroll_idle_playlist(
+    avatar_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user),
+):
+    """
+    Throw away the current 6 idle segments and render 6 fresh ones — same
+    pipeline as the one-time auto-setup on an avatar's first chat session
+    (see app/services/idle_playlist.py's generate_full_idle_set and
+    app/websocket.py), just triggered on demand instead of automatically.
+    Reuses the avatar's existing standard expression photos if it has them
+    (generating any missing ones), then always re-renders all 6 segments
+    with fresh random seeds — new blink/motion timing even against
+    unchanged source photos, which is the actual point of a "re-roll".
+
+    Full pipeline (up to 6 LivePortrait generations + 6 Hallo2 renders)
+    can run 25-40 minutes. Goes through the render queue (see
+    app/services/render_queue.py) rather than a bare create_task/await —
+    if another job for a different avatar is already running, this one
+    waits its turn in the visible, cancellable queue instead of racing it
+    for the GPU. This endpoint still awaits the result before responding
+    (same contract the frontend already expects), it just does so via the
+    queue's wait_for rather than calling the render function directly.
+    """
+    _validate_uuid(avatar_id)
+    result = await db.execute(select(Avatar).where(Avatar.id == avatar_id))
+    avatar = result.scalar_one_or_none()
+    if not avatar:
+        raise HTTPException(status_code=404, detail="Avatar not found")
+    if avatar.user_id != _user_id(current_user):
+        raise HTTPException(status_code=403, detail="Not authorised to modify this avatar")
+
+    job_id = render_queue.enqueue(avatar_id, avatar.name, "reroll")
+    job = await render_queue.wait_for(job_id)
+    if job is None or job.status != "done":
+        detail = job.error if job and job.error else "Failed to re-roll idle playlist"
+        raise HTTPException(status_code=500, detail=detail)
+
+    await db.refresh(avatar)
+    logger.info(f"Idle playlist re-rolled for avatar {avatar_id}: {len(avatar.idle_playlist_urls or [])} segments")
+    return avatar
+
+
 @router.post("/{avatar_id}/expressions", response_model=AvatarResponse)
 async def generate_expression_photo(
     avatar_id: str,
@@ -528,9 +607,16 @@ async def render_idle_segment_from_expression(
     idx = body.slot_index if body.slot_index is not None else len(existing)
     output_path = TMPDIR / f"{avatar_id}_idle_from_expr_{uuid.uuid4().hex[:8]}.mp4"
 
+    # Bookend to the avatar's ORIGINAL photo, not this expression photo —
+    # same reasoning as generate_full_idle_set: every idle segment needs a
+    # shared first/last frame so any two can cut together seamlessly,
+    # regardless of which expression drove each one.
+    bookend_local_path = await resolve_local_image(avatar.id, avatar.s3_key)
+
     try:
         local_result = await hallo2_animator.generate_one_idle_segment(
-            str(cache_path), str(output_path), seed=1042 + idx
+            str(cache_path), str(output_path), seed=1042 + idx,
+            bookend_image_path=bookend_local_path,
         )
     except Exception as e:
         logger.error(f"Idle-from-expression render failed for avatar {avatar_id}: {e}")
@@ -583,6 +669,44 @@ async def set_avatar_voice(
         await db.rollback()
         logger.error(f"Failed to set voice for avatar {avatar_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to update avatar voice")
+
+
+@router.patch("/{avatar_id}/llm-credential", response_model=AvatarResponse)
+async def assign_avatar_llm_credential(
+    avatar_id: str,
+    body: AvatarLlmAssign,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user),
+):
+    """
+    Set (or clear, with llm_credential_id=null) which saved LlmCredential
+    (Settings > API) this avatar's chat sessions use by default — the
+    "Change LLM" button in the Chat view. See app/services/llm_credentials.py
+    and websocket.py's message-handling for where this is actually consumed.
+    """
+    _validate_uuid(avatar_id)
+    result = await db.execute(select(Avatar).where(Avatar.id == avatar_id))
+    avatar = result.scalar_one_or_none()
+    if not avatar:
+        raise HTTPException(status_code=404, detail="Avatar not found")
+    if avatar.user_id != _user_id(current_user):
+        raise HTTPException(status_code=403, detail="Not authorised to modify this avatar")
+
+    if body.llm_credential_id is not None:
+        cred_result = await db.execute(
+            select(LlmCredential).where(LlmCredential.id == body.llm_credential_id)
+        )
+        cred = cred_result.scalar_one_or_none()
+        if not cred:
+            raise HTTPException(status_code=404, detail="LLM credential not found")
+        if cred.user_id != _user_id(current_user):
+            raise HTTPException(status_code=403, detail="Not authorised to use this credential")
+
+    avatar.llm_credential_id = body.llm_credential_id
+    await db.commit()
+    await db.refresh(avatar)
+    logger.info(f"Avatar {avatar_id} LLM credential set to {body.llm_credential_id}")
+    return avatar
 
 
 @router.patch("/{avatar_id}/metadata", response_model=AvatarResponse)
@@ -672,6 +796,16 @@ async def delete_avatar(
         raise HTTPException(status_code=404, detail="Avatar not found")
     if avatar.user_id != _user_id(current_user):
         raise HTTPException(status_code=403, detail="Not authorised to delete this avatar")
+
+    # If this avatar has a QUEUED-but-not-yet-started render job (e.g. the
+    # auto-setup fired the moment its first chat opened, then the user
+    # deleted it before that job started), drop it from the queue — never
+    # let a deleted avatar's photo start rendering after the fact. A
+    # job that's already RUNNING is left alone (cancel_by_avatar only
+    # touches queued jobs) — its Hallo2/LivePortrait calls will finish
+    # against local temp files and then fail harmlessly trying to save
+    # results for an avatar that no longer exists.
+    render_queue.cancel_by_avatar(avatar_id)
 
     # Delete the DB row first (sessions/messages/conversations cascade), THEN
     # the stored files — if the DB delete fails we haven't orphaned the row by

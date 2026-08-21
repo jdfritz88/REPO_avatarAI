@@ -25,6 +25,8 @@ diffusers, etc.).
 import asyncio
 import importlib.util
 import logging
+import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -32,8 +34,38 @@ from pathlib import Path
 from typing import Optional
 
 from app.services.gpu_lock import gpu_lock
+from app.services import win_process_tree as _win_job
 
 logger = logging.getLogger(__name__)
+
+
+def _kill_worker_tree(proc: "asyncio.subprocess.Process", job: Optional[int] = None) -> None:
+    """
+    Kill a worker/server subprocess AND its descendants — see the
+    identical helper (and full explanation) in app/services/animator.py.
+    Same root cause applies here: the ComfyUI venv's python.exe re-execs
+    the real interpreter as a child, so `proc.kill()` alone leaks it —
+    confirmed live tonight: this exact server had been running since the
+    previous day, and killing just the launcher PID left the real ComfyUI
+    process (and its full VRAM allocation) behind. Plain `taskkill /T` has
+    a confirmed real gap too (measured directly: fails outright if the
+    stub already exited by kill time), so `job` — a Windows Job Object
+    assigned at spawn time — is the primary mechanism now, with taskkill
+    kept as a harmless secondary attempt.
+    """
+    if os.name != "nt":
+        if proc.pid is not None:
+            proc.kill()
+        return
+
+    if job:
+        _win_job.kill_job(job, "comfyui_server")
+
+    if proc.pid is not None:
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+        )
 
 _COMFYUI_DIR = Path(__file__).resolve().parent.parent.parent / "model_experiments" / "comfyui"
 _COMFYUI_VENV_PYTHON = _COMFYUI_DIR / "venv" / "Scripts" / "python.exe"
@@ -66,6 +98,7 @@ class ExpressionEditorServiceError(RuntimeError):
 class ExpressionEditorService:
     def __init__(self):
         self._server_proc: Optional[asyncio.subprocess.Process] = None
+        self._server_job: Optional[int] = None  # Windows Job Object handle — see win_process_tree.py
         self._server_lock = asyncio.Lock()
         self._stderr_path = _COMFYUI_DIR / "server_stderr.log"
         self._available = _COMFYUI_VENV_PYTHON.exists() and _COMFYUI_MAIN.exists() and _CLIENT_MODULE_PATH.exists()
@@ -97,8 +130,9 @@ class ExpressionEditorService:
                 if await asyncio.to_thread(self._server_responding):
                     return
                 # Process alive but not answering — treat as dead, restart below.
-                self._server_proc.kill()
+                _kill_worker_tree(self._server_proc, self._server_job)
                 self._server_proc = None
+                self._server_job = None
 
             if not self._available:
                 raise ExpressionEditorServiceError(
@@ -124,6 +158,15 @@ class ExpressionEditorService:
             stderr_file.close()
             self._server_proc = proc
 
+            # Same ordering as animator.py's MuseTalk worker and
+            # hallo2_animator.py's Hallo2 worker: assign to a kill-on-close
+            # job immediately after spawn, before anything else, so the
+            # real interpreter (spawned by this venv's own launcher-stub
+            # python.exe) inherits job membership before it even exists.
+            self._server_job = _win_job.create_kill_on_close_job("comfyui_server")
+            if self._server_job:
+                _win_job.assign_pid_to_job(self._server_job, proc.pid, "comfyui_server")
+
             deadline = asyncio.get_event_loop().time() + _STARTUP_TIMEOUT_S
             while asyncio.get_event_loop().time() < deadline:
                 if proc.returncode is not None:
@@ -134,7 +177,8 @@ class ExpressionEditorService:
                     return
                 await asyncio.sleep(1)
 
-            proc.kill()
+            _kill_worker_tree(proc, self._server_job)
+            self._server_job = None
             self._server_proc = None
             raise ExpressionEditorServiceError(f"ComfyUI server did not respond within {_STARTUP_TIMEOUT_S}s")
 

@@ -1,5 +1,5 @@
 import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios'
-import type { ExpressionParams } from '@/lib/types'
+import type { ExpressionParams, LlmCredential } from '@/lib/types'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -194,6 +194,69 @@ export const api = {
       { photo_url: photoUrl, slot_index: slotIndex },
       { timeout: 10 * 60 * 1000 },
     )
+    return response.data
+  },
+
+  // Throws away the current 6 idle segments and renders 6 fresh ones (see
+  // backend's reroll_idle_playlist). Full pipeline can include generating
+  // missing expression stills too — up to ~40 min worst case, hence the
+  // very generous timeout.
+  rerollIdlePlaylist: async (avatarId: string) => {
+    const response = await apiClient.post(
+      `/api/v1/avatars/${avatarId}/idle-playlist/reroll`,
+      null,
+      { timeout: 45 * 60 * 1000 },
+    )
+    return response.data
+  },
+
+  // LLM credentials (Settings > API) — self-service replacement for the
+  // old "hand-edit a .env file" flow. See backend/app/services/llm_credentials.py.
+  listLlmCredentials: async (): Promise<LlmCredential[]> => {
+    const response = await apiClient.get('/api/v1/llm-credentials/')
+    return response.data
+  },
+
+  getLlmDefaultBaseUrls: async (): Promise<Record<string, string>> => {
+    const response = await apiClient.get('/api/v1/llm-credentials/default-base-urls')
+    return response.data
+  },
+
+  createLlmCredential: async (body: {
+    provider: string; label: string; api_key: string; api_base_url?: string; kindroid_ai_id?: string
+  }): Promise<LlmCredential> => {
+    // Creation also runs a real connection test server-side — generous timeout.
+    const response = await apiClient.post('/api/v1/llm-credentials/', body, { timeout: 30000 })
+    return response.data
+  },
+
+  updateLlmCredential: async (
+    id: string,
+    body: Partial<{ label: string; api_key: string; api_base_url: string; kindroid_ai_id: string; is_favorite: boolean }>,
+  ): Promise<LlmCredential> => {
+    const response = await apiClient.patch(`/api/v1/llm-credentials/${id}`, body)
+    return response.data
+  },
+
+  deleteLlmCredential: async (id: string) => {
+    const response = await apiClient.delete(`/api/v1/llm-credentials/${id}`)
+    return response.data
+  },
+
+  connectLlmCredential: async (id: string): Promise<LlmCredential> => {
+    const response = await apiClient.post(`/api/v1/llm-credentials/${id}/connect`, null, { timeout: 30000 })
+    return response.data
+  },
+
+  reorderLlmCredentials: async (orderedIds: string[]): Promise<LlmCredential[]> => {
+    const response = await apiClient.put('/api/v1/llm-credentials/reorder', { ordered_ids: orderedIds })
+    return response.data
+  },
+
+  assignAvatarLlmCredential: async (avatarId: string, credentialId: string | null) => {
+    const response = await apiClient.patch(`/api/v1/avatars/${avatarId}/llm-credential`, {
+      llm_credential_id: credentialId,
+    })
     return response.data
   },
 

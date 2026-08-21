@@ -53,8 +53,24 @@ class AvatarProcessor:
                 w = min(orig_width - x, w + 2 * padding)
                 h = min(orig_height - y, h + 2 * padding)
 
+                # Square the crop BEFORE resizing — w/h above are computed
+                # independently and aren't guaranteed equal (confirmed:
+                # a tall portrait source produced a non-square face box,
+                # which the resize() below then stretched into a square,
+                # visibly distorting the face in both the thumbnail and
+                # the chat idle view). Expand the shorter side to match
+                # the longer one, centered on the face, clamped to the
+                # image bounds — same principle the no-face-detected
+                # center-crop fallback below already uses correctly.
+                side = min(max(w, h), orig_width, orig_height)
+                cx, cy = x + w / 2, y + h / 2
+                x = int(round(cx - side / 2))
+                y = int(round(cy - side / 2))
+                x = max(0, min(x, orig_width - side))
+                y = max(0, min(y, orig_height - side))
+
                 # Crop to face
-                image = image.crop((x, y, x + w, y + h))
+                image = image.crop((x, y, x + side, y + side))
                 logger.info(f"Face detected and cropped: {face_box}")
             else:
                 logger.warning("No face detected, using center crop")
