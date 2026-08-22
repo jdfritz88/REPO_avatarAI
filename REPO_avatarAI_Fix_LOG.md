@@ -1,4 +1,4 @@
-# REPO_punithVT Fix Log
+# REPO_avatarAI Fix Log
 
 ## 2026-08-14 — MuseTalk animation hangs up to 5-10 minutes per sentence under GPU contention
 
