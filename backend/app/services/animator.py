@@ -21,7 +21,7 @@ from app.services import win_process_tree as _win_job
 TMPDIR = Path(tempfile.gettempdir())
 
 # Centralized log folder at the repo root (backend/app/services/animator.py ->
-# services -> app -> backend -> REPO_punithVT). All per-launch worker logs go
+# services -> app -> backend -> REPO_avatarAI). All per-launch worker logs go
 # here, each with a unique timestamped name, so nothing ever gets overwritten
 # and every run's evidence is preserved permanently in one place.
 LOGS_DIR = Path(__file__).resolve().parents[3] / "Logs"

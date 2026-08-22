@@ -69,7 +69,7 @@ async def main():
         url = c["video_url"]
         path_part = url.split("/uploads/", 1)[-1] if "/uploads/" in url else None
         assert path_part, f"unexpected video_url shape: {url}"
-        local_path = f"F:/Apps/freedom_system/REPO_punithVT/backend/uploads/{path_part}"
+        local_path = f"F:/Apps/freedom_system/REPO_avatarAI/backend/uploads/{path_part}"
         import os
         size = os.path.getsize(local_path)
         print(f"[5] video file on disk: {local_path} ({size} bytes)")
