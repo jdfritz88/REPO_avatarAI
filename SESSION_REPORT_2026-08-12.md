@@ -1,6 +1,6 @@
 # Session Report — 2026-08-12 (night session)
 
-Branch: `branch02_fixes` (REPO_punithVT), clean working tree — no code changes
+Branch: `branch02_fixes` (REPO_avatarAI), clean working tree — no code changes
 made in this repo tonight, investigation only. One commit was made in the
 voice-mode repo (details below).
 

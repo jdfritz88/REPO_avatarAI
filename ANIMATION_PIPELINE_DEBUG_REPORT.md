@@ -1,7 +1,7 @@
 # MuseTalk Animation/Lip-Sync Pipeline — Debug Report
 
 **Date:** 2026-08-11
-**Repo:** `F:\Apps\freedom_system\REPO_punithVT` (fork of `PunithVT/ai-avatar-system`, pushed to `https://github.com/jdfritz88/REPO_punithVT`)
+**Repo:** `F:\Apps\freedom_system\REPO_avatarAI` (fork of `PunithVT/ai-avatar-system`, pushed to `https://github.com/jdfritz88/REPO_avatarAI`)
 **Goal:** Verify that MuseTalk-based lip-sync animation actually works end-to-end using a real avatar photo (a Kindroid participant named "Silva"), and that only the active speaker gets animated (not idle/listening participants).
 **Status: NOT YET CONFIRMED WORKING.** Testing was stopped by the user mid-run after 5 real bugs were found and fixed. The pipeline got further than ever before (past model loading, into actual GPU inference) but never produced a confirmed successful video output before the test was halted. One fix (ffmpeg PATH) has **mixed/inconclusive evidence** — see Bug #5.
 
