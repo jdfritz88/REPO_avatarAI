@@ -40,7 +40,7 @@ _in_progress: set[str] = set()
 # they land in idle_playlist_urls slots 0-5.
 STANDARD_EXPRESSION_PRESETS = [
     "closed_smile", "closed_neutral", "closed_frown",
-    "open_smile_ee", "open_neutral_ah", "open_frown_oo",
+    "open_smile", "open_neutral", "open_frown",
 ]
 
 

@@ -397,6 +397,23 @@ class ConnectionManager:
         task = self._active_turns.pop(session_id, None)
         if task and not task.done():
             task.cancel()
+            # Must actually wait for the cancellation to finish unwinding
+            # before wiping this session's temp dir below. `task.cancel()`
+            # only schedules the CancelledError — it doesn't block until the
+            # task (and animator.py's now-required worker-subprocess kill on
+            # cancellation) has actually run. Without this await, rmtree can
+            # — and, confirmed live, did — delete an audio/video file the
+            # MuseTalk worker subprocess was still actively reading, before
+            # the cancellation had a chance to kill that subprocess first.
+            # Barge-in (interrupt_active_turn) deliberately does NOT await —
+            # it needs sub-100ms turnaround and doesn't delete any files
+            # afterward, so there's nothing there for this race to hit.
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"Turn task for {session_id} raised while unwinding on disconnect: {e}")
 
         ws = self.active_connections.pop(session_id, None)
         self.session_data.pop(session_id, None)

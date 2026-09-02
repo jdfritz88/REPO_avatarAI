@@ -361,6 +361,24 @@ class AvatarAnimator:
                     self._worker_proc = None
                     self._worker_job = None
                     raise RuntimeError(f"MuseTalk inference timed out after {infer_timeout}s")
+                except asyncio.CancelledError:
+                    # Our own await got cancelled (session disconnect / barge-in
+                    # interrupting this turn's task) — but the worker SUBPROCESS
+                    # is a separate OS process communicating over stdin/stdout;
+                    # cancelling this coroutine does nothing to it. Left alone, it
+                    # keeps running the now-orphaned job indefinitely (confirmed
+                    # live: 19+ minutes of real GPU/CPU burn with zero progress,
+                    # after its input audio file was deleted out from under it by
+                    # the disconnect handler's session-dir cleanup racing this
+                    # exact in-flight job). Kill it and clear the persistent-worker
+                    # slot so the next caller spawns a fresh worker instead of
+                    # reusing one left in an unknown state, then propagate the
+                    # cancellation — swallowing it here would break the calling
+                    # task's own cancellation semantics.
+                    _kill_worker_tree(proc, self._worker_job)
+                    self._worker_proc = None
+                    self._worker_job = None
+                    raise
 
                 # Empty read == worker exited mid-job (EOF on stdout). Reset so the
                 # next call respawns instead of erroring on a half-dead process.

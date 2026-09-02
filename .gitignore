@@ -4,6 +4,7 @@ frontend/node_modules/
 .venv/
 venv/
 env/
+backend/mediapipe_env/
 
 # Portable Redis-compatible server (downloaded, not app code)
 redis-portable/

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, type CSSProperties } from 'react'
 import {
   Send, Mic, MicOff, Video, Loader2, Volume2, VolumeX,
   Sparkles, Clock, Copy, RotateCcw, Wand2,
@@ -148,18 +148,31 @@ function shuffled<T>(arr: T[]): T[] {
  * (see hallo2_worker.py's find_loop_point), and every clip also STARTS
  * from that same pose (Hallo2 always seeds generation from the static
  * source photo) — so any clip can follow any other without a visible cut.
+ *
+ * Two persistent <video> elements, alternating, rather than one element
+ * whose `src`/key gets swapped on every segment change. The earlier
+ * single-video version remounted a fresh <video> per segment (see git
+ * history) — clean in React terms, but every remount means the browser
+ * refetches and re-decodes from nothing, so there's a real network+decode
+ * gap with nothing to paint: a visible black flash between every segment,
+ * flagged live by the user. Fixed by always keeping the NEXT segment
+ * preloaded (`preload="auto"`, `.load()` called ahead of time) in the
+ * currently-hidden element, so swapping is just "play the one that's
+ * already buffered and flip which is on top" — no reload, no gap.
  */
 function IdlePlaylistVideo({ urls }: { urls: string[] }) {
   const orderRef = useRef<string[]>(shuffled(urls))
-  const posRef = useRef(0)
-  // `current` alone isn't a safe React key: with 1 segment (or whenever a
-  // reshuffle happens to repeat the same URL at a cycle boundary), advance()
-  // would set the identical string again, React bails out of the state
-  // update (Object.is same-value check), the <video> never remounts, and
-  // playback sticks at `ended` forever. `plays` is a monotonic counter so
-  // every advance forces a fresh remount regardless of URL repeats.
-  const [plays, setPlays] = useState(0)
-  const current = orderRef.current[posRef.current]
+  const posRef = useRef(0) // index of the segment currently playing
+  const refA = useRef<HTMLVideoElement>(null)
+  const refB = useRef<HTMLVideoElement>(null)
+  const activeRef = useRef<'A' | 'B'>('A')
+  const initializedRef = useRef(false) // guards the double-invoke below
+  const [, forceRender] = useState(0) // ref changes alone don't repaint opacity
+
+  const peekAt = (offset: number) => {
+    const arr = orderRef.current
+    return arr[(posRef.current + offset) % arr.length]
+  }
 
   const advance = () => {
     posRef.current += 1
@@ -167,20 +180,90 @@ function IdlePlaylistVideo({ urls }: { urls: string[] }) {
       orderRef.current = shuffled(urls)
       posRef.current = 0
     }
-    setPlays((p) => p + 1)
   }
 
+  // Chrome has a "background video" power-saving heuristic that auto-pauses
+  // a silent <video> it doesn't yet consider on-screen/prominent — confirmed
+  // live via a rejected play() promise: "video-only background media was
+  // paused to save power". Calling .play() before the element has actually
+  // been through a paint pass is exactly the situation that trips it, and
+  // React Strict Mode's dev-only double-invoke of this effect (confirmed via
+  // console logging: this effect really does run twice on mount) made it
+  // worse by aborting the first play() with a second src assignment before
+  // it could even resolve. Fixed by (1) a mounted-guard so the setup body
+  // only actually runs once, and (2) waiting a couple of animation frames
+  // (i.e. after a real paint) before the first .play() call.
+  const playWithRetry = (video: HTMLVideoElement, attempt = 0) => {
+    console.log('[idle-diag] playWithRetry attempt', attempt, 'for', (video.currentSrc || '').split('/').pop())
+    video.play().then(
+      () => console.log('[idle-diag] play() resolved on attempt', attempt),
+      (e) => {
+        console.log('[idle-diag] play() REJECTED attempt', attempt, e.name, e.message)
+        if (attempt >= 5) {
+          console.log('[idle-diag] GIVING UP after', attempt, 'attempts')
+          return
+        }
+        setTimeout(() => playWithRetry(video, attempt + 1), 300)
+      }
+    )
+  }
+
+  useEffect(() => {
+    if (initializedRef.current) return
+    initializedRef.current = true
+    const a = refA.current
+    const b = refB.current
+    if (!a || !b) return
+    a.src = peekAt(0)
+    b.src = peekAt(1)
+    b.load()
+    requestAnimationFrame(() => requestAnimationFrame(() => playWithRetry(a)))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleEnded = (which: 'A' | 'B') => {
+    if (activeRef.current !== which) return // stale event from the hidden element
+    const finishing = which === 'A' ? refA.current : refB.current
+    const preloaded = which === 'A' ? refB.current : refA.current
+    if (!preloaded) return
+
+    preloaded.currentTime = 0
+    playWithRetry(preloaded)
+    activeRef.current = which === 'A' ? 'B' : 'A'
+    advance()
+    if (finishing) {
+      finishing.src = peekAt(1) // prep the segment AFTER what's now playing
+      finishing.load()
+    }
+    forceRender((n) => n + 1)
+  }
+
+  const videoStyle = (which: 'A' | 'B'): CSSProperties => ({
+    borderRadius: '0.75rem',
+    opacity: activeRef.current === which ? 1 : 0,
+  })
+
   return (
-    <video
-      key={plays}
-      src={current}
-      autoPlay
-      muted
-      playsInline
-      onEnded={advance}
-      className="relative z-10 w-full h-full object-cover"
-      style={{ borderRadius: '0.75rem' }}
-    />
+    <>
+      <video
+        ref={refA}
+        muted
+        playsInline
+        preload="auto"
+        onEnded={() => handleEnded('A')}
+        className="absolute inset-0 z-10 w-full h-full object-cover"
+        style={videoStyle('A')}
+      />
+      <video
+        ref={refB}
+        muted
+        playsInline
+        preload="auto"
+        onEnded={() => handleEnded('B')}
+        className="absolute inset-0 z-10 w-full h-full object-cover"
+        style={videoStyle('B')}
+      />
+    </>
   )
 }
 
