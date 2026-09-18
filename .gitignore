@@ -110,3 +110,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Local decision notes (not app code, kept off GitHub)
+DECISIONS.md
